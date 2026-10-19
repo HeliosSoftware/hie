@@ -1,10 +1,10 @@
-# Helios Integration Engine (working name)
+# Helios Integration Engine
 
 Gets data from source feeds into HFS, the Helios FHIR Server:
 - **Feeds:** folders today; S3, databases and other FHIR servers later.
 - **Transforms:** in Python.
 - **Delivery:** idempotent, with retries.
-- **Around it:** per-record traceability, an API for the Titration UI, Prometheus metrics, and alerts that include "this feed went quiet".
+- **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this feed went quiet".
 
 This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md).
 

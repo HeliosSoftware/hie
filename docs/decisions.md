@@ -7,10 +7,10 @@ Each decision states what was chosen, the evidence behind it, and what it costs.
 **Chosen:** HIE is its own repository and process. It writes to HFS with standard FHIR REST calls (`POST /` with a `batch` Bundle) and reads nothing from HFS internals.
 
 **Why:**
-- Titration is planned as a separate product, with HIE between it and HFS/HTS.
+- The analytics product that consumes the data is separate from HFS, with HIE between it and HFS/HTS.
 - Talking FHIR means HIE works with any FHIR server, and HFS stays a plain FHIR server with nothing integration-specific inside it.
 
-**Cost:** HIE cannot use HFS shortcuts (for example a direct database load). For very large feeds, the FHIR bulk operations (`$import`, `$bulk-submit`) are the path (see 7).
+**Cost:** HIE cannot use HFS shortcuts (for example a direct database load). For very large feeds, `$bulk-submit` is the path (see 7).
 
 ## 2. Rust for the engine
 
@@ -46,7 +46,7 @@ Each decision states what was chosen, the evidence behind it, and what it costs.
 - Camel's YAML routes were easy to read and diff.
 - Mapping rules are agreements with a data source and should have history and review.
 
-**Cost:** No editing from a UI yet. The Titration UI could write feed definitions through an API later.
+**Cost:** No editing from a UI yet. A client UI could write feed definitions through an API later.
 
 ## 5. Every row is stored before delivery
 
@@ -83,7 +83,7 @@ Each decision states what was chosen, the evidence behind it, and what it costs.
 - One bad row must not block the rest of a file. A batch gives a status per entry.
 - Lab results do not need all-or-nothing per file.
 
-**Cost:** No atomicity across a file. Feeds that need it (a resource and its dependents) would use `transaction`; very large feeds would use `$bulk-submit` or `$import`.
+**Cost:** No atomicity across a file. Feeds that need it (a resource and its dependents) would use `transaction`; very large feeds would use `$bulk-submit`.
 
 ## 8. Two kinds of failure, handled differently
 
@@ -124,14 +124,14 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Why:** OIE's per-message history (status, error, source file, row) was the most useful thing either tool offered. It answers "where did this value come from, and what happened to it". Demo §5 shows a corrected row with both values and HFS's `201`.
 
-## 11. Monitoring: an HTTP API for Titration and Prometheus metrics
+## 11. Monitoring: an HTTP API for client UIs and Prometheus metrics
 
 **Chosen:**
-- `/api/...` serves feed status (freshness, counts, last alert), files, records and alerts for the Titration UI.
+- `/api/...` serves feed status (freshness, counts, last alert), files, records and alerts for a client UI.
 - `/metrics` exposes Prometheus gauges and counters.
 
 **Why:**
-- The Titration Data page needs per-feed freshness and completeness.
+- A data-sources page in a client UI needs per-feed freshness and completeness.
 - Camel's counters were in memory and reset on restart. Here they come from the stored history.
 - Prometheus is what HFS already exposes, so the same monitoring stack (Grafana or a hosted product) can watch both. Integrating a monitoring product stays an option, not a rewrite.
 
@@ -176,5 +176,5 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
 - Authentication to HFS (SMART backend services).
-- `$bulk-submit` delivery.
+- `$bulk-submit` delivery (HFS fetches a manifest and NDJSON files, which can live on S3).
 - PostgreSQL, multiple instances, a UI, FHIR Mapping Language.
