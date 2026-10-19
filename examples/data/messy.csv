@@ -1,0 +1,7 @@
+patient,code,display,value,unit,date
+Patient/3,GLU,,99,mg/dL,2026-10-16
+Patient/4,2345-7,Glucose,alto,mg/dL,2026-10-16
+Patient/5,2345-7,Glucose,110,mg/dL,2026-10-16,extra
+Patient/6,2345-7,Glucose,120,mmHg,2026-10-16
+Patient/7,XYZ,Mystery,5,mg/dL,2026-10-16
+Patient/8,HGB,,12.1,g/dL,16/10/2026

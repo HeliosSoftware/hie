@@ -1,0 +1,6 @@
+fhir_base_url: http://localhost:8080
+database: data/hie.db
+listen: 127.0.0.1:8090
+feeds_dir: feeds
+alerts:
+  webhook_url:

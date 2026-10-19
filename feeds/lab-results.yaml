@@ -1,0 +1,13 @@
+id: lab-results
+name: Lab results
+source:
+  type: folder
+  path: inbox/lab-results
+  pattern: "*.csv"
+  poll_seconds: 5
+transform: transforms/lab_results.py
+delivery:
+  batch_size: 100
+  initial_backoff_ms: 2000
+  alert_after_attempts: 5
+expect_every: 24h

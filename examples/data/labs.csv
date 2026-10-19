@@ -1,0 +1,4 @@
+patient,code,display,value,unit,date
+Patient/1,2345-7,Glucose,95,mg/dL,2026-10-15
+Patient/2,2345-7,Glucose,180,mg/dL,2026-10-15
+Patient/1,718-7,Hemoglobin,13.5,g/dL,2026-10-14
