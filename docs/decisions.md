@@ -12,17 +12,20 @@ Each decision states what was chosen, the evidence behind it, and what it costs.
 
 **Cost:** HIE cannot use HFS shortcuts (for example a direct database load). For very large feeds, `$bulk-submit` is the path (see 7).
 
-## 2. Rust for the engine
+## 2. .NET for the engine
 
-**Chosen:** The engine (polling, storage, delivery, API, alerts) is a single Rust binary.
+**Chosen:** The engine (polling, storage, delivery, API, alerts) is a .NET 10 service, built and run on Linux (see the `Dockerfile`). It replaces the Rust prototype, which stays in the history as the behavioural reference: its tests were ported one for one.
 
 **Why:**
-- It is the same toolchain, CI and dependency set as HFS and HTS: the crate uses the versions already in the HFS lockfile.
-- It can later reuse `helios-fhir` types.
-- One binary, a small memory footprint, no JVM.
-- Both engines tried are Java. OIE needed a server, an embedded database and a desktop client, and the client failed three ways on Windows before it worked: launcher JVM options, missing JavaFX, classpath order.
+- The team that will own the engine is faster in .NET, and the service has to ship within weeks. [Discussion #2](https://github.com/HeliosSoftware/hie/discussions/2) has the comparison.
+- The engine is I/O bound (reading objects, calling HFS, waiting on the transform runtime); the two stacks do not differ in throughput enough to outweigh who maintains it.
+- Aspire is adopted for running the surrounding services together in development; the engine emits OpenTelemetry signals so the same dashboard covers it and HFS.
+- The condition attached to the decision is that it runs on Linux, which the container image satisfies.
 
-**Cost:** Transform authors should not need Rust (see 3).
+**Cost:**
+- Nothing is shared at the code level with HFS and HTS (their FHIR models, auth and observability crates); the engine talks to HFS only over the FHIR API, which decision 1 already required.
+- A larger runtime and memory footprint than the Rust binary.
+- Transform authors still should not need the engine's language (see 3).
 
 ## 3. Transforms in Python, in a separate process
 

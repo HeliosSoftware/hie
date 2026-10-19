@@ -7,7 +7,7 @@ Gets data from source feeds into HFS, the Helios FHIR Server:
 - **Delivery:** idempotent, with retries.
 - **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this feed went quiet".
 
-This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1).
+The engine is a .NET 10 service that runs on Linux (see the `Dockerfile`). This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1), and the choice of stack in [discussion #2](https://github.com/HeliosSoftware/hie/discussions/2).
 
 ## What the prototype does
 
@@ -21,36 +21,43 @@ Run against a real HFS (SQLite) with the example lab feed:
 | **3.** The same rows arrive in a new file | Sent as conditional updates. HFS still has 3 `Observation`s; the re-sent one is at `versionId` 2. |
 | **4.** `messy.csv`: one good row (local code `GLU`) and five bad ones | The good row is mapped to LOINC and delivered. The five are rejected, each with its line and reason: `value 'alto' is not a number`, `expected 6 columns ... found 7`, `unit 'mmHg' has no UCUM mapping`, `test code 'XYZ' is neither LOINC nor in the local code table`, `date '16/10/2026' is not YYYY-MM-DD`. One alert for the file. |
 | **5.** The `alto` row is corrected and reprocessed through the API | Delivered (`201 Created`). The record keeps both the original and the corrected value. |
-| **6.** No data within `expect_every` | One `silence` alert, not one per check (covered by the integration test). |
+| **6.** No data within `expect_every` | One `silence` alert, not one per check (covered by the end-to-end test). |
 
 And with Synthea output for three patients, in both of its FHIR shapes:
 
 | Feed | Input | Result |
 |---|---|---|
-| `fhir_bundle` | 3 transaction Bundles (394 to 700 entries each, `urn:uuid` references between entries) | 1,775 resources delivered by id, 0 rejected. References rewritten to `Type/id`: an `Observation.subject` in HFS reads `Patient/bfc9…`. |
+| `fhir_bundle` | 3 transaction Bundles (394 to 700 entries each, `urn:uuid` references between entries) | 1,775 resources delivered by id, 0 rejected. References rewritten to `Type/id`. |
 | `ndjson` | 17 files, one per resource type, from Synthea's bulk-data export | 1,775 resources delivered, 0 rejected. |
-| Both together | The same patients twice, in two formats | HFS holds each resource once: 3 `Patient`, 214 `Encounter`, 415 `Observation`. Both feeds finished in 17 s on a laptop, Python transform included. |
+| Both together | The same patients twice, in two formats | HFS holds each resource once: 3 `Patient`, 214 `Encounter`, 415 `Observation`. |
 
 ## Run it
 
 You need:
-- Rust 1.90 or later;
+- the .NET 10 SDK;
 - Python 3.8 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it);
 - HFS running at the URL in `hie.yaml` (default `http://localhost:8080`).
 
 ```sh
-cargo run -- check          # validate hie.yaml and feeds/
-cargo run                   # watch feeds, serve the API on 127.0.0.1:8090
+dotnet run --project src/Hie -- check     # validate hie.yaml and feeds/
+dotnet run --project src/Hie              # watch feeds, serve the API on 127.0.0.1:8090
 cp examples/data/labs.csv inbox/lab-results/
 curl localhost:8090/api/feeds
+```
+
+On Linux, in a container:
+
+```sh
+docker build -t hie .
+docker run --rm -p 8090:8090 -v $PWD/inbox:/hie/inbox -e HIE_LOG=Information hie
 ```
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `HIE_CONFIG` | `hie.yaml` | Engine configuration file |
 | `HIE_RUNTIME_DIR` | `hie_runtime` next to the config | Location of the Python worker |
-| `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...) |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
+| `HIE_LOG` | `Information` | Minimum log level (`Debug`, `Warning`, ...) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles and roles work too) |
 
 ## Adding a feed
 
@@ -109,24 +116,21 @@ def transform(record, context):
 ## Layout
 
 ```
-src/            engine: config, sources (folder, S3), readers (CSV, NDJSON, Bundle), transform worker,
-                FHIR delivery, pipeline, API, alerts, storage
+src/Hie/        the engine: Config, Sources (folder, S3), Reader (CSV, NDJSON, Bundle), Transformer (Python worker),
+                Fhir (delivery), Pipeline (feed runner), Api, Alerts, Db (SQLite)
+tests/Hie.Tests xUnit: unit tests, and end-to-end tests against a stand-in FHIR server
 hie_runtime/    Python side of the transform protocol (worker.py, hie.DataError)
 transforms/     Python transforms: lab_results.py (CSV to Observation), fhir_passthrough.py
 feeds/          one YAML file per feed
 examples/data/  sample files used by the tests and the demo
-tests/          end-to-end Rust tests with a stand-in FHIR server; Python tests for the transform
 docs/           design decisions
 ```
 
 ## Tests
 
 ```sh
-cargo test                                 # unit tests and the end-to-end tests
+dotnet test
 python -m unittest tests/test_lab_results.py
-cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder feed: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store: an NDJSON export delivered by id and archived under the processed prefix.
-
-They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server that can be taken down. They cover a folder feed (the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, the silence alert) and the object-store path the S3 source uses, with an in-memory store. They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.

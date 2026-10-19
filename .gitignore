@@ -1,4 +1,8 @@
-/target
+bin/
+obj/
 /data
 /inbox
 __pycache__/
+*.user
+.vs/
+/target
