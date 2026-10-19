@@ -7,7 +7,7 @@ Gets data from source feeds into HFS, the Helios FHIR Server:
 - **Delivery:** idempotent, with retries.
 - **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this feed went quiet".
 
-This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [docs/discussion-helios-integration-engine.md](docs/discussion-helios-integration-engine.md).
+This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1).
 
 ## What the prototype does
 
@@ -116,7 +116,7 @@ transforms/     Python transforms: lab_results.py (CSV to Observation), fhir_pas
 feeds/          one YAML file per feed
 examples/data/  sample files used by the tests and the demo
 tests/          end-to-end Rust tests with a stand-in FHIR server; Python tests for the transform
-docs/           design decisions and the architectural discussion
+docs/           design decisions
 ```
 
 ## Tests
