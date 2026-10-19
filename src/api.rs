@@ -69,7 +69,7 @@ fn feed_status(db: &Db, feed: &FeedConfig) -> anyhow::Result<Value> {
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
-        "source": feed.source_dir().display().to_string(),
+        "source": feed.source.describe(),
         "expect_every": feed.expect_every.map(human),
         "freshness": freshness,
         "last_received_at": last.and_then(chrono::DateTime::from_timestamp_millis).map(|t| t.to_rfc3339()),

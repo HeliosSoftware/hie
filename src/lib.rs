@@ -1,4 +1,4 @@
-//! Helios Integration Engine (working name): gets data from source feeds into HFS,
+//! Helios Integration Engine: gets data from source feeds into HFS,
 //! with per-record traceability, idempotent delivery, retries and alerts.
 
 pub mod alerts;
@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod fhir;
 pub mod pipeline;
+pub mod reader;
 pub mod source;
 pub mod transform;
 
@@ -27,20 +28,17 @@ pub fn build(
         db.clone(),
         config.alerts.webhook_url.clone(),
     ));
-    let runners = feeds
-        .iter()
-        .cloned()
-        .map(|f| {
-            Arc::new(pipeline::FeedRunner::new(
-                f,
-                db.clone(),
-                fhir.clone(),
-                alerts.clone(),
-                &config.python,
-                runtime_dir,
-            ))
-        })
-        .collect();
+    let mut runners = Vec::with_capacity(feeds.len());
+    for feed in feeds.iter().cloned() {
+        runners.push(Arc::new(pipeline::FeedRunner::new(
+            feed,
+            db.clone(),
+            fhir.clone(),
+            alerts.clone(),
+            &config.python,
+            runtime_dir,
+        )?));
+    }
     Ok((
         runners,
         api::AppState {

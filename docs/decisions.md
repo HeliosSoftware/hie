@@ -169,9 +169,40 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - In the exercise, a file written by Windows PowerShell (UTF-16) made Camel fail and retry it forever.
 - A seventh column appearing in a feed was the example given for messy sources.
 
+## 15. Two delivery keys: the resource's `id`, or a business identifier
+
+**Chosen:** A resource that carries an `id` is written to `PUT {type}/{id}`. One without needs an `identifier` and is written as a conditional update on it. A resource with neither is rejected.
+
+**Why:**
+- Data that already is FHIR (an NDJSON export, a Synthea Bundle) comes with ids that other resources reference. Writing it under those ids keeps the references valid, and re-sending the same export updates instead of duplicating: the same three patients delivered as Bundles and again as NDJSON left HFS with each resource once.
+- Data mapped from a non-FHIR source has no id to offer; the business identifier is what makes it idempotent (decision 6).
+
+**Cost:** A transform that wants a conditional update must not set `id`.
+
+## 16. A Bundle is split into records, with references made absolute
+
+**Chosen:** A `fhir_bundle` file is read as one record per entry. Before that, references to another entry's `fullUrl` (`urn:uuid:...`, which Synthea writes) are rewritten to that entry's `Type/id`.
+
+**Why:**
+- Per-record traceability (decision 10) needs one record per resource, not one per file.
+- Delivered independently, the entries would otherwise keep `urn:uuid` references that only make sense inside the transaction.
+- Posting the Bundle as a transaction would keep the references intact but lose the per-resource history and the per-entry disposition; it stays an option for feeds that need atomicity (decision 7).
+
+**Cost:** References to entries that carry no `id` cannot be rewritten and are passed through unchanged.
+
+## 17. S3 through `object_store`
+
+**Chosen:** The S3 source uses the `object_store` crate (the AWS implementation), listing a prefix, fetching objects and renaming them under an archive prefix.
+
+**Why:**
+- `object_store` is already in the HFS dependency set (SQL-on-FHIR uses it), and one trait covers S3, S3-compatible stores (MinIO, through `endpoint`), the local filesystem and an in-memory store, so the same source code is tested in memory and runs against a bucket.
+- Credentials come from the standard AWS environment, like every other AWS tool an operator runs.
+
+**Not yet verified:** The source has not been run against a real bucket; the object-store path is covered by the in-memory tests. That is the first thing to do once a bucket exists.
+
 ## Not in the prototype
 
-- Connectors besides a folder: S3, database, another FHIR server.
+- Connectors besides a folder and S3: database, another FHIR server.
 - HL7v2 input.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).

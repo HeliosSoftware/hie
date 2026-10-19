@@ -80,6 +80,32 @@ pub fn conditional_url(resource_type: &str, system: &str, value: &str) -> String
     )
 }
 
+/// What makes a resource's delivery idempotent: its own id, or a business identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryKey {
+    /// The resource carries an `id`: `PUT {type}/{id}`.
+    Id { resource_type: String, id: String },
+    /// `PUT {type}?identifier={system}|{value}`.
+    Identifier {
+        resource_type: String,
+        system: String,
+        value: String,
+    },
+}
+
+pub fn request_url(key: &DeliveryKey) -> String {
+    match key {
+        DeliveryKey::Id { resource_type, id } => {
+            format!("{resource_type}/{}", encode_component(id))
+        }
+        DeliveryKey::Identifier {
+            resource_type,
+            system,
+            value,
+        } => conditional_url(resource_type, system, value),
+    }
+}
+
 /// Builds a `batch` Bundle of conditional updates: an entry fails alone, and sending
 /// the same record twice updates the resource instead of creating a second one.
 pub fn batch_bundle(entries: &[(String, Value)]) -> Value {

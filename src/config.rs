@@ -54,6 +54,24 @@ pub enum SourceConfig {
         min_file_age_ms: u64,
         archive: Option<PathBuf>,
     },
+    /// An S3 bucket. Credentials come from the usual AWS environment
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, profiles).
+    S3 {
+        bucket: String,
+        #[serde(default)]
+        prefix: String,
+        region: Option<String>,
+        /// For S3-compatible stores such as MinIO.
+        endpoint: Option<String>,
+        #[serde(default = "default_pattern")]
+        pattern: String,
+        #[serde(default = "default_poll_seconds")]
+        poll_seconds: u64,
+        #[serde(default = "default_min_file_age_ms")]
+        min_file_age_ms: u64,
+        #[serde(default = "default_archive_prefix")]
+        archive_prefix: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -61,6 +79,8 @@ pub enum SourceConfig {
 pub enum Format {
     #[default]
     Csv,
+    Ndjson,
+    FhirBundle,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +131,9 @@ fn default_poll_seconds() -> u64 {
 fn default_min_file_age_ms() -> u64 {
     1000
 }
+fn default_archive_prefix() -> String {
+    "processed".into()
+}
 fn default_batch_size() -> usize {
     100
 }
@@ -124,46 +147,31 @@ fn default_alert_after_attempts() -> u32 {
     5
 }
 
-impl FeedConfig {
-    pub fn source_dir(&self) -> &Path {
-        match &self.source {
-            SourceConfig::Folder { path, .. } => path,
-        }
-    }
-
-    pub fn archive_dir(&self) -> PathBuf {
-        match &self.source {
-            SourceConfig::Folder {
-                archive: Some(a), ..
-            } => a.clone(),
-            SourceConfig::Folder { path, .. } => path.join("processed"),
+impl SourceConfig {
+    /// Where the feed reads from, for logs and the API.
+    pub fn describe(&self) -> String {
+        match self {
+            SourceConfig::Folder { path, .. } => path.display().to_string(),
+            SourceConfig::S3 { bucket, prefix, .. } => format!("s3://{bucket}/{prefix}"),
         }
     }
 
     pub fn poll_interval(&self) -> Duration {
-        match &self.source {
-            SourceConfig::Folder { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+        match self {
+            SourceConfig::Folder { poll_seconds, .. } | SourceConfig::S3 { poll_seconds, .. } => {
+                Duration::from_secs(*poll_seconds)
+            }
         }
     }
+}
 
-    pub fn min_file_age(&self) -> Duration {
-        match &self.source {
-            SourceConfig::Folder {
-                min_file_age_ms, ..
-            } => Duration::from_millis(*min_file_age_ms),
-        }
-    }
-
-    pub fn matches(&self, file_name: &str) -> bool {
-        let SourceConfig::Folder { pattern, .. } = &self.source;
-        glob_match(pattern, file_name)
-    }
-
+impl FeedConfig {
     fn resolve(&mut self, base: &Path) -> Result<()> {
-        let SourceConfig::Folder { path, archive, .. } = &mut self.source;
-        *path = base.join(&*path);
-        if let Some(a) = archive {
-            *a = base.join(&*a);
+        if let SourceConfig::Folder { path, archive, .. } = &mut self.source {
+            *path = base.join(&*path);
+            if let Some(a) = archive {
+                *a = base.join(&*a);
+            }
         }
         self.transform = base.join(&self.transform);
         if !self.transform.is_file() {
@@ -235,7 +243,8 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
-fn glob_match(pattern: &str, name: &str) -> bool {
+/// Matches a file name against a pattern with at most one `*`, ignoring case.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern.eq_ignore_ascii_case(name),
         Some((prefix, suffix)) => {
@@ -266,5 +275,26 @@ mod tests {
         assert!(glob_match("lab_*.csv", "lab_2026-10-18.csv"));
         assert!(!glob_match("*.csv", "labs.csv.tmp"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn an_s3_source_parses_with_defaults() {
+        let feed: FeedConfig = serde_yaml::from_str(
+            "id: x\nname: X\nsource:\n  type: s3\n  bucket: lab\n  prefix: results/\nformat: ndjson\ntransform: t.py\n",
+        )
+        .unwrap();
+        assert_eq!(feed.format, Format::Ndjson);
+        assert_eq!(feed.source.describe(), "s3://lab/results/");
+        match feed.source {
+            SourceConfig::S3 {
+                pattern,
+                archive_prefix,
+                ..
+            } => assert_eq!(
+                (pattern.as_str(), archive_prefix.as_str()),
+                ("*", "processed")
+            ),
+            _ => panic!("expected s3"),
+        }
     }
 }

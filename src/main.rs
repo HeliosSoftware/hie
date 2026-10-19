@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
                 "  {} ({}) <- {} via {}",
                 f.id,
                 f.name,
-                f.source_dir().display(),
+                f.source.describe(),
                 f.transform.display()
             );
         }

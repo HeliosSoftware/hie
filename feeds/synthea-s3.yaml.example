@@ -1,0 +1,18 @@
+# Rename to .yaml to enable. Credentials come from the AWS environment
+# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION or a profile).
+id: synthea-s3
+name: Synthea NDJSON on S3
+source:
+  type: s3
+  bucket: my-lab-feeds
+  prefix: synthea/
+  region: us-east-1
+  # endpoint: http://localhost:9000   # MinIO or another S3-compatible store
+  pattern: "*.ndjson"
+  poll_seconds: 30
+  archive_prefix: synthea-processed
+format: ndjson
+transform: transforms/fhir_passthrough.py
+delivery:
+  batch_size: 200
+expect_every: 24h

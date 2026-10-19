@@ -1,25 +1,27 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::alerts::Alerter;
 use crate::config::FeedConfig;
 use crate::db::{Db, WorkItem, now_ms};
 use crate::fhir::{self, EntryResult, FhirClient, SendError};
-use crate::source;
+use crate::reader;
+use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
 
 const TRANSFORM_CHUNK: usize = 200;
 
-/// Moves one feed's data through: folder -> stored rows -> transform -> HFS.
-/// Every row is in the database before its file leaves the inbox, so a crash or an
-/// HFS outage never loses data, and every row keeps its file name and line number.
+/// Moves one feed's data through: source -> stored rows -> transform -> HFS.
+/// Every row is in the database before its object leaves the source, so a crash or an
+/// HFS outage never loses data, and every row keeps its object name and line number.
 pub struct FeedRunner {
     pub feed: FeedConfig,
+    source: Source,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     transformer: Transformer,
@@ -36,10 +38,34 @@ impl FeedRunner {
         alerts: Arc<Alerter>,
         python: &str,
         runtime_dir: &Path,
+    ) -> Result<Self> {
+        let source = Source::from_config(&feed)?;
+        Ok(Self::with_source(
+            feed,
+            source,
+            db,
+            fhir,
+            alerts,
+            python,
+            runtime_dir,
+        ))
+    }
+
+    /// Builds a runner over a given source, for tests and for sources that are
+    /// not configured from a file.
+    pub fn with_source(
+        feed: FeedConfig,
+        source: Source,
+        db: Arc<Db>,
+        fhir: Arc<FhirClient>,
+        alerts: Arc<Alerter>,
+        python: &str,
+        runtime_dir: &Path,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
         Self {
             feed,
+            source,
             db,
             fhir,
             transformer,
@@ -50,19 +76,19 @@ impl FeedRunner {
     }
 
     pub async fn run(self: Arc<Self>) {
-        tracing::info!(feed = %self.feed.id, dir = %self.feed.source_dir().display(), "watching");
+        tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), "watching");
         loop {
             if let Err(e) = self.tick().await {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
             }
-            tokio::time::sleep(self.feed.poll_interval()).await;
+            tokio::time::sleep(self.feed.source.poll_interval()).await;
         }
     }
 
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
-        self.scan()?;
+        self.scan().await?;
         self.transform_received().await?;
         self.deliver_due().await?;
         self.finish()?;
@@ -70,42 +96,18 @@ impl FeedRunner {
         Ok(())
     }
 
-    fn scan(&self) -> Result<()> {
-        let dir = self.feed.source_dir();
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| self.feed.matches(n))
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let age = std::fs::metadata(&path)?
-                .modified()
-                .ok()
-                .and_then(|m| SystemTime::now().duration_since(m).ok())
-                .unwrap_or_default();
-            if age < self.feed.min_file_age() {
-                continue;
-            }
-            self.ingest_file(&path)?;
+    async fn scan(&self) -> Result<()> {
+        for key in self.source.list().await? {
+            let incoming = self.source.fetch(&key).await?;
+            self.ingest(incoming).await?;
         }
         Ok(())
     }
 
-    fn ingest_file(&self, path: &Path) -> Result<()> {
+    async fn ingest(&self, incoming: Incoming) -> Result<()> {
         let feed = &self.feed.id;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let bytes = std::fs::read(path)?;
-        let sha = source::sha256_hex(&bytes);
+        let Incoming { key, name, bytes } = incoming;
+        let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
             let id = self.db.insert_file(
@@ -117,14 +119,13 @@ impl FeedRunner {
                 Some(original),
             )?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
-            return self.archive(path, id, &name);
+            return self.source.acknowledge(&key, &format!("{id}-{name}")).await;
         }
 
         let file_id =
             self.db
                 .insert_file(feed, &name, &sha, bytes.len() as u64, "processing", None)?;
-        let parsed = source::decode_text(&bytes).and_then(|text| source::read_csv(&text));
-        match parsed {
+        match reader::read(self.feed.format, &bytes) {
             Ok(records) => {
                 let rows: Vec<_> = records
                     .into_iter()
@@ -142,18 +143,9 @@ impl FeedRunner {
                 )?;
             }
         }
-        self.archive(path, file_id, &name)
-    }
-
-    fn archive(&self, path: &Path, file_id: i64, name: &str) -> Result<()> {
-        let dir = self.feed.archive_dir();
-        std::fs::create_dir_all(&dir)?;
-        let target = dir.join(format!("{file_id}-{name}"));
-        if std::fs::rename(path, &target).is_err() {
-            std::fs::copy(path, &target)?;
-            std::fs::remove_file(path)?;
-        }
-        Ok(())
+        self.source
+            .acknowledge(&key, &format!("{file_id}-{name}"))
+            .await
     }
 
     async fn transform_received(&self) -> Result<()> {
@@ -228,12 +220,8 @@ impl FeedRunner {
                 .into_iter()
                 .flatten()
             {
-                let (rt, system, value) =
-                    transform::check_resource(resource).map_err(anyhow::Error::msg)?;
-                entries.push((
-                    fhir::conditional_url(&rt, &system, &value),
-                    resource.clone(),
-                ));
+                let key = transform::check_resource(resource).map_err(anyhow::Error::msg)?;
+                entries.push((fhir::request_url(&key), resource.clone()));
                 owner.push(i);
             }
         }

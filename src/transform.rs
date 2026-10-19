@@ -3,6 +3,8 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+
+use crate::fhir::DeliveryKey;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -143,20 +145,33 @@ fn parse_reply(reply: &Value) -> Outcome {
     Outcome::Resources(resources)
 }
 
-/// Checks what HIE itself relies on: a resource type, and a business identifier
-/// that makes delivery idempotent (`PUT {type}?identifier=system|value`).
-pub fn check_resource(resource: &Value) -> std::result::Result<(String, String, String), String> {
+/// Checks what HIE itself relies on: a resource type, and a key that makes delivery
+/// idempotent. A resource with an `id` is written to `{type}/{id}`; one without needs
+/// a business identifier and is written as a conditional update on it.
+pub fn check_resource(resource: &Value) -> std::result::Result<DeliveryKey, String> {
     let rt = resource
         .get("resourceType")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or("resource has no resourceType")?;
+    if let Some(id) = resource
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(DeliveryKey::Id {
+            resource_type: rt.to_string(),
+            id: id.to_string(),
+        });
+    }
     let ident = resource
         .get("identifier")
         .and_then(Value::as_array)
         .and_then(|ids| ids.first())
         .ok_or_else(|| {
-            format!("{rt} has no identifier; HIE needs one to avoid duplicates on re-send")
+            format!(
+                "{rt} has neither id nor identifier; HIE needs one to avoid duplicates on re-send"
+            )
         })?;
     let system = ident
         .get("system")
@@ -167,7 +182,11 @@ pub fn check_resource(resource: &Value) -> std::result::Result<(String, String, 
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
     match (system, value) {
-        (Some(s), Some(v)) => Ok((rt.to_string(), s.to_string(), v.to_string())),
+        (Some(s), Some(v)) => Ok(DeliveryKey::Identifier {
+            resource_type: rt.to_string(),
+            system: s.to_string(),
+            value: v.to_string(),
+        }),
         _ => Err(format!("{rt}.identifier[0] needs both system and value")),
     }
 }
@@ -192,16 +211,29 @@ mod tests {
     }
 
     #[test]
-    fn resources_need_an_identifier() {
-        let ok = json!({"resourceType": "Observation", "identifier": [{"system": "urn:x", "value": "1"}]});
+    fn resources_need_an_id_or_an_identifier() {
+        let by_identifier = json!({"resourceType": "Observation", "identifier": [{"system": "urn:x", "value": "1"}]});
         assert_eq!(
-            check_resource(&ok).unwrap(),
-            ("Observation".into(), "urn:x".into(), "1".into())
+            check_resource(&by_identifier).unwrap(),
+            DeliveryKey::Identifier {
+                resource_type: "Observation".into(),
+                system: "urn:x".into(),
+                value: "1".into()
+            }
+        );
+        let by_id =
+            json!({"resourceType": "Patient", "id": "p1", "identifier": [{"value": "mrn"}]});
+        assert_eq!(
+            check_resource(&by_id).unwrap(),
+            DeliveryKey::Id {
+                resource_type: "Patient".into(),
+                id: "p1".into()
+            }
         );
         assert!(
             check_resource(&json!({"resourceType": "Observation"}))
                 .unwrap_err()
-                .contains("identifier")
+                .contains("neither id nor identifier")
         );
         assert!(check_resource(&json!({"identifier": []})).is_err());
     }

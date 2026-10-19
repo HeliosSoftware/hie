@@ -1,0 +1,12 @@
+id: synthea-bundles
+name: Synthea patient bundles
+source:
+  type: folder
+  path: inbox/synthea
+  pattern: "*.json"
+  poll_seconds: 5
+format: fhir_bundle
+transform: transforms/fhir_passthrough.py
+delivery:
+  batch_size: 200
+expect_every: 7d
