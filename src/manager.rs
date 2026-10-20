@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::alerts::Alerter;
 use crate::config::{Config, FeedConfig, SourceConfig};
-use crate::db::Db;
+use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
 use crate::source::{Probe, Source};
@@ -111,6 +111,7 @@ impl SourceManager {
 
     pub fn start_all(&self, feeds: Vec<FeedConfig>) -> Result<()> {
         for feed in feeds {
+            self.ensure_default_rule(&feed, None)?;
             self.start(feed)?;
         }
         Ok(())
@@ -177,7 +178,7 @@ impl SourceManager {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    pub fn create(&self, body: &Value) -> Result<FeedConfig, ManagerError> {
+    pub fn create(&self, body: &Value, by: Option<&str>) -> Result<FeedConfig, ManagerError> {
         let (submitted, resolved) = self.parse(body)?;
         if self.source(&submitted.id).is_some() || self.file_for(&submitted.id).exists() {
             return Err(ManagerError::Conflict(format!(
@@ -186,8 +187,31 @@ impl SourceManager {
             )));
         }
         self.write(&submitted)?;
+        self.ensure_default_rule(&submitted, by)?;
         self.start(resolved.clone())?;
         Ok(resolved)
+    }
+
+    /// Every source is born with one silence rule, so nobody has to remember to
+    /// watch it: `expect_every` when the definition says so, two hours otherwise.
+    fn ensure_default_rule(&self, feed: &FeedConfig, by: Option<&str>) -> Result<()> {
+        if self.db.has_rule(&feed.id, "silence")? {
+            return Ok(());
+        }
+        let rule = Rule {
+            id: 0,
+            source_id: Some(feed.id.clone()),
+            condition: "silence".into(),
+            threshold: feed
+                .expect_every_text
+                .clone()
+                .unwrap_or_else(|| "2h".into()),
+            notify: vec![],
+            channels: vec!["app".into(), "webhook".into()],
+            enabled: true,
+            created_by: by.map(str::to_string),
+        };
+        self.db.insert_rule(&rule).map(drop)
     }
 
     pub fn replace(&self, id: &str, body: &Value) -> Result<FeedConfig, ManagerError> {

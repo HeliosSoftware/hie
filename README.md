@@ -77,7 +77,7 @@ delivery:
   batch_size: 100            # entries per batch Bundle
   initial_backoff_ms: 2000   # doubles per failed attempt, up to 5 minutes
   alert_after_attempts: 5
-expect_every: 24h            # alert when nothing arrives for this long
+expect_every: 24h            # the silence rule the source is born with
 ```
 
 An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO.
@@ -92,6 +92,19 @@ An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (de
 `public_url` in `hie.yaml` must be the URL HFS reaches the engine at.
 
 The same document is what `POST /api/sources` takes. Before creating one, `POST /api/sources/test` with `{"source": {...}}` lists the connection once and answers with the evidence: reachable or not, in how many milliseconds, how many objects match, and the newest one.
+
+### Alerts and rules
+
+Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). Every source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it.
+
+| Condition | Threshold | Fires when | Clears when |
+|-----------|-----------|------------|-------------|
+| `silence` | a duration, `2h` | nothing has arrived for longer than that | data arrives |
+| `missing_by` | a time of day in UTC, `06:00` | that time passes and nothing arrived today | the file arrives |
+| `rejected_share` | a percentage, `10%` | a load has more than that share of rows rejected | a later load is within the limit |
+| `unreachable` | a number of attempts, `5` | delivery to HFS has failed that many times in a row | delivery succeeds |
+
+A condition raises **one** alert per rule and source, open until it clears itself; the alert keeps its rule, who was notified, the channels, and the clearing time and reason. `app` alerts are what the UI lists; `webhook` posts them to `alerts.webhook_url` (the `text` field is the shape Slack and Teams accept); `email` is accepted and recorded, with no mail sink wired yet. A source with no `rejected_share` rule alerts on every load that rejects rows, and one with no `unreachable` rule alerts after `delivery.alert_after_attempts`.
 
 ## Transforms
 
@@ -138,7 +151,9 @@ def transform(record, context):
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=` | Alerts, newest first |
+| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
+| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
+| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok"}` |
 
@@ -189,6 +204,6 @@ python -m unittest tests/test_lab_results.py
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
 
 They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.

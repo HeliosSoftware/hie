@@ -144,7 +144,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 **Chosen:**
 - HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`.
 - Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept).
-- A repeated condition alerts once.
+- A repeated condition alerts once. (Superseded in part by decision 22: conditions are rules, and an alert clears itself.)
 
 **Why:**
 - OIE's alerts needed an SMTP server or a second channel, and they cannot detect a feed going quiet.
@@ -247,6 +247,18 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - A resource without an `id` cannot go this way; the pre-flight rejects it and says so.
 - A line HFS refuses that the pre-flight did not predict is rejected with "no receipt", plus HFS's first error text, without a certain attribution.
 - The engine's `public_url` must be reachable from HFS, and the folder-file route must stay open (unguessable token in the path).
+
+## 22. Alert rules are data, and an alert clears itself
+
+**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, UTC), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours. Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
+
+**Why:**
+- The four conditions are the ones the monitoring brief asks the UI to offer, with the thresholds in the units a person would type.
+- An alert that clears itself is what lets a list of *open* alerts mean something; an alert that never closes has to be reasoned about by its timestamp.
+- Rules as data rather than fields of the source definition: a rule may cover every source, an operator may add one without touching the YAML a developer owns, and the UI edits them on their own page.
+- The default rule keeps the promise of decision 12 that a quiet source is noticed without anyone configuring it.
+
+**Cost / not yet:** `email` is recorded but not sent; the webhook is still the one outward channel. Recipients are free text; nothing resolves them against the identity provider. Rules are evaluated once per pass of the source, so a `silence` or `missing_by` alert is late by up to one poll interval.
 
 ## Not in the prototype
 

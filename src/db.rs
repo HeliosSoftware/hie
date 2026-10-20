@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS submissions (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS alert_rules (
+  id INTEGER PRIMARY KEY,
+  source_id TEXT,
+  condition TEXT NOT NULL,
+  threshold TEXT NOT NULL,
+  notify TEXT NOT NULL DEFAULT '[]',
+  channels TEXT NOT NULL DEFAULT '[\"app\"]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT,
+  created_at INTEGER NOT NULL
+);
 ";
 
 /// Columns added after the first schema; each is added when missing.
@@ -75,7 +86,40 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("records", "submission", "TEXT"),
+    ("alerts", "rule_id", "INTEGER"),
+    ("alerts", "cleared_at", "INTEGER"),
+    ("alerts", "cleared_reason", "TEXT"),
+    ("alerts", "notify", "TEXT"),
+    ("alerts", "channels", "TEXT"),
 ];
+
+/// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
+/// fail", "the file is not there by 06:00", "HFS cannot be reached after 5 attempts".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Rule {
+    #[serde(default)]
+    pub id: i64,
+    /// `None` applies to every source.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    pub condition: String,
+    pub threshold: String,
+    #[serde(default)]
+    pub notify: Vec<String>,
+    #[serde(default = "default_channels")]
+    pub channels: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+fn default_channels() -> Vec<String> {
+    vec!["app".into(), "webhook".into()]
+}
+fn default_enabled() -> bool {
+    true
+}
 
 /// A `$bulk-submit` submission the engine handed to HFS and is waiting on.
 #[derive(Debug, Clone)]
@@ -691,14 +735,160 @@ impl Db {
         })
     }
 
-    pub fn insert_alert(&self, feed: Option<&str>, kind: &str, message: &str) -> Result<i64> {
+    pub fn insert_alert(
+        &self,
+        feed: Option<&str>,
+        kind: &str,
+        message: &str,
+        rule: Option<&Rule>,
+    ) -> Result<i64> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![feed, kind, message, now_ms()],
+                "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    feed,
+                    kind,
+                    message,
+                    now_ms(),
+                    rule.map(|r| r.id),
+                    rule.map(|r| serde_json::to_string(&r.notify).unwrap_or_default()),
+                    rule.map(|r| serde_json::to_string(&r.channels).unwrap_or_default()),
+                ],
             )?;
             Ok(c.last_insert_rowid())
         })
+    }
+
+    /// The open alert (not cleared) of this kind for a source and rule, if any.
+    pub fn open_alert(
+        &self,
+        feed: &str,
+        kind: &str,
+        rule_id: Option<i64>,
+    ) -> Result<Option<(i64, i64)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, created_at FROM alerts
+                 WHERE feed_id = ?1 AND kind = ?2 AND cleared_at IS NULL AND (rule_id IS ?3)
+                 ORDER BY id DESC LIMIT 1",
+                params![feed, kind, rule_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+    }
+
+    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE alerts SET cleared_at = ?2, cleared_reason = ?3 WHERE id = ?1 AND cleared_at IS NULL",
+                params![id, now_ms(), reason],
+            )
+            .map(drop)
+        })
+    }
+
+    // ---- alert rules -------------------------------------------------------
+
+    fn rule_rows(&self, sql: &str, p: impl Params) -> Result<Vec<Rule>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(sql)?;
+            let rows = stmt.query_map(p, |r| {
+                let notify: String = r.get(4)?;
+                let channels: String = r.get(5)?;
+                Ok(Rule {
+                    id: r.get(0)?,
+                    source_id: r.get(1)?,
+                    condition: r.get(2)?,
+                    threshold: r.get(3)?,
+                    notify: serde_json::from_str(&notify).unwrap_or_default(),
+                    channels: serde_json::from_str(&channels).unwrap_or_default(),
+                    enabled: r.get::<_, i64>(6)? != 0,
+                    created_by: r.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by FROM alert_rules";
+
+    pub fn rules(&self) -> Result<Vec<Rule>> {
+        self.rule_rows(&format!("{} ORDER BY id", Self::RULE_SELECT), [])
+    }
+
+    pub fn rule(&self, id: i64) -> Result<Option<Rule>> {
+        Ok(self
+            .rule_rows(&format!("{} WHERE id = ?1", Self::RULE_SELECT), params![id])?
+            .into_iter()
+            .next())
+    }
+
+    /// The enabled rules that watch a source: its own and the ones for every source.
+    pub fn rules_for(&self, feed: &str) -> Result<Vec<Rule>> {
+        self.rule_rows(
+            &format!(
+                "{} WHERE enabled = 1 AND (source_id IS NULL OR source_id = ?1) ORDER BY id",
+                Self::RULE_SELECT
+            ),
+            params![feed],
+        )
+    }
+
+    pub fn has_rule(&self, feed: &str, condition: &str) -> Result<bool> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT 1 FROM alert_rules WHERE source_id = ?1 AND condition = ?2 LIMIT 1",
+                params![feed, condition],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+        })
+    }
+
+    pub fn insert_rule(&self, rule: &Rule) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    rule.source_id,
+                    rule.condition,
+                    rule.threshold,
+                    serde_json::to_string(&rule.notify).unwrap_or_default(),
+                    serde_json::to_string(&rule.channels).unwrap_or_default(),
+                    rule.enabled,
+                    rule.created_by,
+                    now_ms()
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE alert_rules SET source_id = ?2, condition = ?3, threshold = ?4, notify = ?5, channels = ?6, enabled = ?7
+                 WHERE id = ?1",
+                params![
+                    id,
+                    rule.source_id,
+                    rule.condition,
+                    rule.threshold,
+                    serde_json::to_string(&rule.notify).unwrap_or_default(),
+                    serde_json::to_string(&rule.channels).unwrap_or_default(),
+                    rule.enabled
+                ],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    pub fn delete_rule(&self, id: i64) -> Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM alert_rules WHERE id = ?1", params![id])? > 0))
     }
 
     pub fn feed_counts(&self, feed: &str) -> Result<Value> {
