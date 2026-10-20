@@ -97,7 +97,8 @@ impl Source {
         }
     }
 
-    pub async fn acknowledge(&self, key: &str, archived_name: &str) -> Result<()> {
+    /// Moves the object out of the way and returns where it is now.
+    pub async fn acknowledge(&self, key: &str, archived_name: &str) -> Result<String> {
         match self {
             Source::Folder(f) => f.acknowledge(key, archived_name),
             Source::Object(o) => o.acknowledge(key, archived_name).await,
@@ -159,14 +160,14 @@ impl FolderSource {
         })
     }
 
-    fn acknowledge(&self, key: &str, archived_name: &str) -> Result<()> {
+    fn acknowledge(&self, key: &str, archived_name: &str) -> Result<String> {
         std::fs::create_dir_all(&self.archive)?;
         let target = self.archive.join(archived_name);
         if std::fs::rename(key, &target).is_err() {
             std::fs::copy(key, &target)?;
             std::fs::remove_file(key)?;
         }
-        Ok(())
+        Ok(target.to_string_lossy().into_owned())
     }
 }
 
@@ -243,13 +244,13 @@ impl ObjectSource {
         })
     }
 
-    async fn acknowledge(&self, key: &str, archived_name: &str) -> Result<()> {
+    async fn acknowledge(&self, key: &str, archived_name: &str) -> Result<String> {
         let to = ObjectPath::from(format!("{}/{archived_name}", self.archive));
         self.store
             .rename(&ObjectPath::from(key), &to)
             .await
             .with_context(|| format!("archiving {key}"))?;
-        Ok(())
+        Ok(to.to_string())
     }
 }
 

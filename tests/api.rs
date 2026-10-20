@@ -499,3 +499,178 @@ async fn transforms_and_monitoring_are_served() {
     assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
     assert_eq!(stats["today"]["files"], 0);
 }
+
+#[tokio::test]
+async fn a_load_shows_its_failures_grouped_and_retries_them() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(
+        Router::new()
+            .route("/", post(batch))
+            .with_state(urls.clone()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/lab-results.yaml"),
+        "id: lab-results\nname: Lab results\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 60\n  min_file_age_ms: 0\ntransform: transforms/lab_results.py\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+
+    std::fs::copy(
+        repo().join("examples/data/messy.csv"),
+        root.join("inbox/messy.csv"),
+    )
+    .unwrap();
+    http.post(format!("{api}/api/sources/lab-results/check-now"))
+        .send()
+        .await
+        .unwrap();
+    let (api2, http2) = (api.clone(), http.clone());
+    wait_until(
+        move || {
+            let (api, http) = (api2.clone(), http2.clone());
+            Box::pin(async move {
+                let s: Value = http
+                    .get(format!("{api}/api/sources/lab-results"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                s["records"]["rejected"] == 5 && s["records"]["sent"] == 1
+            })
+        },
+        "the messy file to finish",
+    )
+    .await;
+
+    // The loads list: one load, its method, what it read, wrote and failed, how long it took.
+    let loads: Value = http
+        .get(format!("{api}/api/sources/lab-results/loads"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let load = &loads["loads"][0];
+    assert_eq!(
+        (
+            load["name"].as_str(),
+            load["method"].as_str(),
+            load["status"].as_str()
+        ),
+        (Some("messy.csv"), Some("rest"), Some("done"))
+    );
+    assert_eq!(
+        (
+            load["records"].as_i64(),
+            load["sent"].as_i64(),
+            load["rejected"].as_i64()
+        ),
+        (Some(6), Some(1), Some(5))
+    );
+    assert!(load["took_ms"].as_i64().unwrap() >= 0);
+    assert_eq!(load["archived"], 1);
+    let load_id = load["id"].as_i64().unwrap();
+
+    // One load: the failures grouped by reason, with sample rows and the first line.
+    let detail: Value = http
+        .get(format!("{api}/api/loads/{load_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failures = detail["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 5, "{failures:?}");
+    let alto = failures
+        .iter()
+        .find(|f| f["reason"].as_str().unwrap().contains("'alto'"))
+        .unwrap();
+    assert_eq!(
+        (
+            alto["kind"].as_str(),
+            alto["count"].as_i64(),
+            alto["first_line"].as_i64()
+        ),
+        (Some("data"), Some(1), Some(3))
+    );
+    assert_eq!(alto["samples"][0]["raw"]["value"], "alto");
+    let parse = failures.iter().find(|f| f["kind"] == "parse").unwrap();
+    assert!(parse["reason"].as_str().unwrap().contains("found 7"));
+
+    // Retry the rows with one reason: they go back through the transform (and fail again, unchanged).
+    let retried: Value = http
+        .post(format!("{api}/api/loads/{load_id}/retry"))
+        .json(&json!({"reason": alto["reason"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retried["retried"], 1);
+    let (api3, http3) = (api.clone(), http.clone());
+    wait_until(
+        move || {
+            let (api, http) = (api3.clone(), http3.clone());
+            Box::pin(async move {
+                let l: Value = http
+                    .get(format!("{api}/api/loads/{load_id}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                l["status"] == "done" && l["rejected"] == 5
+            })
+        },
+        "the retried row to settle",
+    )
+    .await;
+
+    // Retry them all.
+    let retried: Value = http
+        .post(format!("{api}/api/loads/{load_id}/retry"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retried["retried"], 5);
+    assert_eq!(
+        http.get(format!("{api}/api/loads/999"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}

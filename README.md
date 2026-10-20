@@ -126,7 +126,9 @@ def transform(record, context):
 | `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
 | `POST /api/sources/{id}/resume` | Resumes and passes at once |
 | `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
-| `GET /api/sources/{id}/files` | Files received, with duplicates and per-file sent/rejected counts |
+| `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
+| `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
+| `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
 | `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |

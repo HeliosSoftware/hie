@@ -73,6 +73,7 @@ CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, statu
 /// Columns added after the first schema; each is added when missing.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
+    ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("records", "submission", "TEXT"),
 ];
 
@@ -203,10 +204,11 @@ impl Db {
         })
     }
 
+    /// The key and name of a file still waiting at its source (not archived yet).
     pub fn file_source(&self, file_id: i64) -> Result<Option<(String, String)>> {
         self.with(|c| {
             c.query_row(
-                "SELECT source_key, name FROM files WHERE id = ?1 AND source_key IS NOT NULL",
+                "SELECT source_key, name FROM files WHERE id = ?1 AND source_key IS NOT NULL AND archived = 0",
                 params![file_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -214,13 +216,62 @@ impl Db {
         })
     }
 
-    pub fn clear_file_source(&self, file_id: i64) -> Result<()> {
+    /// The file was moved out of the way; `key` is where it lives now, so a retry
+    /// can still hand it to HFS.
+    pub fn mark_file_archived(&self, file_id: i64, key: &str) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "UPDATE files SET source_key = NULL WHERE id = ?1",
-                params![file_id],
+                "UPDATE files SET source_key = ?2, archived = 1 WHERE id = ?1",
+                params![file_id, key],
             )
             .map(drop)
+        })
+    }
+
+    /// Rejected records of a file, grouped by reason, each with a few sample rows.
+    pub fn failure_groups(&self, file_id: i64) -> Result<Vec<Value>> {
+        let groups = self.query_json(
+            "SELECT error_kind AS kind, error AS reason, COUNT(*) AS n, MIN(line) AS first_line
+             FROM records WHERE file_id = ?1 AND status = 'rejected'
+             GROUP BY error_kind, error ORDER BY n DESC, first_line",
+            params![file_id],
+        )?;
+        let mut out = Vec::with_capacity(groups.len());
+        for g in groups {
+            let samples = self.query_json(
+                "SELECT id, line, raw FROM records
+                 WHERE file_id = ?1 AND status = 'rejected' AND error_kind IS ?2 AND error IS ?3
+                 ORDER BY line LIMIT 3",
+                params![file_id, g["kind"].as_str(), g["reason"].as_str()],
+            )?;
+            out.push(json!({
+                "kind": g["kind"],
+                "reason": g["reason"],
+                "count": g["n"],
+                "first_line": g["first_line"],
+                "samples": samples,
+            }));
+        }
+        Ok(out)
+    }
+
+    /// Puts a file's rejected records back at the start, all of them or those with
+    /// one reason. Returns how many.
+    pub fn reprocess_rejected(&self, file_id: i64, reason: Option<&str>) -> Result<usize> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                        response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL, updated_at = ?3
+                 WHERE file_id = ?1 AND status = 'rejected' AND (?2 IS NULL OR error = ?2)",
+                params![file_id, reason, now_ms()],
+            )?;
+            if n > 0 {
+                c.execute(
+                    "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = ?1",
+                    params![file_id],
+                )?;
+            }
+            Ok(n)
         })
     }
 

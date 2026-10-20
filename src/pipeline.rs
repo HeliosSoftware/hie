@@ -170,7 +170,11 @@ impl FeedRunner {
                 None,
             )?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
-            return self.source.acknowledge(&key, &format!("{id}-{name}")).await;
+            let archived = self
+                .source
+                .acknowledge(&key, &format!("{id}-{name}"))
+                .await?;
+            return self.db.mark_file_archived(id, &archived);
         }
 
         // On the bulk path the object stays at its source until HFS has read it.
@@ -207,10 +211,11 @@ impl FeedRunner {
         if keep && readable {
             return Ok(());
         }
-        self.db.clear_file_source(file_id)?;
-        self.source
+        let archived = self
+            .source
             .acknowledge(&key, &format!("{file_id}-{name}"))
-            .await
+            .await?;
+        self.db.mark_file_archived(file_id, &archived)
     }
 
     async fn transform_received(&self) -> Result<()> {
@@ -490,10 +495,11 @@ impl FeedRunner {
         };
         for file_id in file_ids {
             if let Some((key, name)) = self.db.file_source(file_id)? {
-                self.source
+                let archived = self
+                    .source
                     .acknowledge(&key, &format!("{file_id}-{name}"))
                     .await?;
-                self.db.clear_file_source(file_id)?;
+                self.db.mark_file_archived(file_id, &archived)?;
             }
         }
         Ok(())
