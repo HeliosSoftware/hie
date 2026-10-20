@@ -234,6 +234,20 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Not yet:** scopes and roles (any valid token from the issuer may do everything); the engine's own credentials for calling HFS (client credentials); per-user audit of changes.
 
+## 21. `$bulk-submit` points HFS at the source objects, and receipts map by `Type/id`
+
+**Chosen:** On `delivery.method: bulk_submit` the engine does not rewrite files. It stores the rows, runs a pre-flight in Rust instead of the transform (`resourceType` and `id` present), and serves a manifest whose entries are pre-signed URLs of the S3 objects, or the engine's own file URLs for a folder. The kick-off closes the submission (`submissionStatus: completed`); the engine polls `$bulk-submit-status`, reads the receipt files, marks a record `sent` when a `{"reference": "Type/id"}` for it appears and `rejected` otherwise, then archives the objects. One submission per drop, a `submissionId` derived from the files, `409` from HFS treated as "already held".
+
+**Why:**
+- It is the picture agreed in discussion #1 for an NDJSON export in a bucket: HFS does the ingestion, the engine keeps the history and the dispositions.
+- HFS's receipts carry `Type/id` for every stored resource but **no input line number or file** on the error side (the line number exists inside HFS and is not published). Mapping by `Type/id` is what the published receipts allow; the engine's pre-flight is what names the line for the failures it can predict. HFS publishing the line in its error `OperationOutcome` would let the rest be named too; that is requested on the HFS side.
+- Objects stay at the source until the receipts are in, so a retry or a replacement manifest can point at them again, and a pre-signed URL never points at an archived key.
+
+**Cost:**
+- A resource without an `id` cannot go this way; the pre-flight rejects it and says so.
+- A line HFS refuses that the pre-flight did not predict is rejected with "no receipt", plus HFS's first error text, without a certain attribution.
+- The engine's `public_url` must be reachable from HFS, and the folder-file route must stay open (unguessable token in the path).
+
 ## Not in the prototype
 
 - Connectors besides a folder and S3: database, another FHIR server.

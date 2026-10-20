@@ -12,6 +12,10 @@ pub struct Config {
     pub database: PathBuf,
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// The URL HFS reaches this engine at: manifests and folder-sourced files for
+    /// `$bulk-submit` are served from it.
+    #[serde(default = "default_public_url")]
+    pub public_url: String,
     #[serde(default = "default_python")]
     pub python: String,
     /// One YAML file per source. The engine writes here when a source is created
@@ -102,6 +106,10 @@ pub enum Format {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryConfig {
+    /// `rest`: batch Bundles, one PUT per record. `bulk_submit`: the source objects
+    /// are handed to HFS through a `$bulk-submit` manifest, without a transform.
+    #[serde(default)]
+    pub method: DeliveryMethod,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     #[serde(default = "default_initial_backoff_ms")]
@@ -110,15 +118,32 @@ pub struct DeliveryConfig {
     pub max_backoff_ms: u64,
     #[serde(default = "default_alert_after_attempts")]
     pub alert_after_attempts: u32,
+    /// How long the URLs in a manifest stay valid for HFS to fetch the objects.
+    #[serde(default = "default_url_ttl_seconds")]
+    pub url_ttl_seconds: u64,
+    /// Objects per manifest; a larger drop is split into several submissions.
+    #[serde(default = "default_manifest_objects_max")]
+    pub manifest_objects_max: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMethod {
+    #[default]
+    Rest,
+    BulkSubmit,
 }
 
 impl Default for DeliveryConfig {
     fn default() -> Self {
         Self {
+            method: DeliveryMethod::Rest,
             batch_size: default_batch_size(),
             initial_backoff_ms: default_initial_backoff_ms(),
             max_backoff_ms: default_max_backoff_ms(),
             alert_after_attempts: default_alert_after_attempts(),
+            url_ttl_seconds: default_url_ttl_seconds(),
+            manifest_objects_max: default_manifest_objects_max(),
         }
     }
 }
@@ -165,6 +190,15 @@ fn default_max_backoff_ms() -> u64 {
 }
 fn default_alert_after_attempts() -> u32 {
     5
+}
+fn default_url_ttl_seconds() -> u64 {
+    86_400
+}
+fn default_manifest_objects_max() -> usize {
+    50
+}
+fn default_public_url() -> String {
+    "http://127.0.0.1:8090".into()
 }
 
 impl SourceConfig {

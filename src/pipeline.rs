@@ -7,9 +7,10 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::alerts::Alerter;
-use crate::config::FeedConfig;
+use crate::bulk::{self, BulkSubmitter, Poll};
+use crate::config::{DeliveryMethod, FeedConfig};
 use crate::db::{Db, WorkItem, now_ms};
-use crate::fhir::{self, EntryResult, FhirClient, SendError};
+use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
@@ -31,6 +32,7 @@ pub struct FeedRunner {
     source: Source,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
+    bulk: Option<BulkSubmitter>,
     transformer: Transformer,
     alerts: Arc<Alerter>,
     started_at: i64,
@@ -38,6 +40,7 @@ pub struct FeedRunner {
 }
 
 impl FeedRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         feed: FeedConfig,
         db: Arc<Db>,
@@ -45,6 +48,8 @@ impl FeedRunner {
         alerts: Arc<Alerter>,
         python: &str,
         runtime_dir: &Path,
+        fhir_base_url: &str,
+        public_url: &str,
     ) -> Result<Self> {
         let source = Source::from_config(&feed)?;
         Ok(Self::with_source(
@@ -55,11 +60,14 @@ impl FeedRunner {
             alerts,
             python,
             runtime_dir,
+            fhir_base_url,
+            public_url,
         ))
     }
 
     /// Builds a runner over a given source, for tests and for sources that are
     /// not configured from a file.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_source(
         feed: FeedConfig,
         source: Source,
@@ -68,13 +76,18 @@ impl FeedRunner {
         alerts: Arc<Alerter>,
         python: &str,
         runtime_dir: &Path,
+        fhir_base_url: &str,
+        public_url: &str,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
+        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit)
+            .then(|| BulkSubmitter::new(fhir_base_url, public_url));
         Self {
             feed,
             source,
             db,
             fhir,
+            bulk,
             transformer,
             alerts,
             started_at: now_ms(),
@@ -116,8 +129,14 @@ impl FeedRunner {
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
         self.scan().await?;
-        self.transform_received().await?;
-        self.deliver_due().await?;
+        if self.bulk.is_some() {
+            self.preflight_received()?;
+            self.submit_pending().await?;
+            self.poll_submissions().await?;
+        } else {
+            self.transform_received().await?;
+            self.deliver_due().await?;
+        }
         self.finish()?;
         self.check_silence()?;
         Ok(())
@@ -137,6 +156,10 @@ impl FeedRunner {
         let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
+            if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
+                // The same object, still waiting for HFS to fetch it: leave it alone.
+                return Ok(());
+            }
             let id = self.db.insert_file(
                 feed,
                 &name,
@@ -144,15 +167,24 @@ impl FeedRunner {
                 bytes.len() as u64,
                 "duplicate",
                 Some(original),
+                None,
             )?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
             return self.source.acknowledge(&key, &format!("{id}-{name}")).await;
         }
 
-        let file_id =
-            self.db
-                .insert_file(feed, &name, &sha, bytes.len() as u64, "processing", None)?;
-        match reader::read(self.feed.format, &bytes) {
+        // On the bulk path the object stays at its source until HFS has read it.
+        let keep = self.bulk.is_some();
+        let file_id = self.db.insert_file(
+            feed,
+            &name,
+            &sha,
+            bytes.len() as u64,
+            "processing",
+            None,
+            keep.then_some(key.as_str()),
+        )?;
+        let readable = match reader::read(self.feed.format, &bytes) {
             Ok(records) => {
                 let rows: Vec<_> = records
                     .into_iter()
@@ -160,6 +192,7 @@ impl FeedRunner {
                     .collect();
                 self.db.insert_records(file_id, feed, &rows)?;
                 tracing::info!(feed, file = %name, records = rows.len(), "received");
+                true
             }
             Err(e) => {
                 self.db.fail_file(file_id, &format!("{e:#}"))?;
@@ -168,8 +201,13 @@ impl FeedRunner {
                     "unreadable_file",
                     &format!("{}: cannot read {name}: {e:#}", self.feed.name),
                 )?;
+                false
             }
+        };
+        if keep && readable {
+            return Ok(());
         }
+        self.db.clear_file_source(file_id)?;
         self.source
             .acknowledge(&key, &format!("{file_id}-{name}"))
             .await
@@ -218,6 +256,247 @@ impl FeedRunner {
                 }
             }
         }
+    }
+
+    /// The bulk path has no transform: a record is the resource HFS will read. The
+    /// engine only predicts what HFS will refuse (no resourceType, no id); the receipt
+    /// is what decides.
+    fn preflight_received(&self) -> Result<()> {
+        loop {
+            let items = self.db.received_records(&self.feed.id, TRANSFORM_CHUNK)?;
+            if items.is_empty() {
+                return Ok(());
+            }
+            for item in &items {
+                match transform::check_resource(&item.raw) {
+                    Ok(DeliveryKey::Id { .. }) => self
+                        .db
+                        .mark_transformed(item.id, &Value::Array(vec![item.raw.clone()]))?,
+                    Ok(DeliveryKey::Identifier { resource_type, .. }) => self.db.mark_rejected(
+                        item.id,
+                        "validation",
+                        &format!("{resource_type} has no id; $bulk-submit stores resources by id"),
+                        None,
+                    )?,
+                    Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+                }
+            }
+        }
+    }
+
+    /// Opens one submission per drop: the files with pending records, up to the
+    /// manifest cap, handed to HFS through a manifest the engine serves.
+    async fn submit_pending(&self) -> Result<()> {
+        let Some(bulk) = &self.bulk else {
+            return Ok(());
+        };
+        loop {
+            let files = self
+                .db
+                .submittable_files(&self.feed.id, self.feed.delivery.manifest_objects_max)?;
+            if files.is_empty() {
+                return Ok(());
+            }
+            let token = bulk::token();
+            let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
+            let mut entries = Vec::new();
+            let mut record_ids = Vec::new();
+            let mut hashes = Vec::new();
+            for file in &files {
+                let url = match &file.source_key {
+                    Some(key) => match self.source.share(key, ttl).await? {
+                        Some(signed) => signed,
+                        None => bulk.file_url(&token, file.file_id),
+                    },
+                    None => bulk.file_url(&token, file.file_id),
+                };
+                let resource_type = file
+                    .records
+                    .iter()
+                    .map(|(_, rt)| rt.as_str())
+                    .find(|rt| !rt.is_empty())
+                    .unwrap_or("Resource")
+                    .to_string();
+                entries.push((resource_type, url, file.records.len()));
+                record_ids.extend(file.records.iter().map(|(id, _)| *id));
+                hashes.push(file.name.clone());
+            }
+            let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+            let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
+            let manifest = bulk.manifest(&entries);
+            self.db.create_submission(
+                &token,
+                &self.feed.id,
+                &submission_id,
+                &manifest,
+                &record_ids,
+            )?;
+            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records = record_ids.len(), "submission opened");
+        }
+    }
+
+    /// Moves every open submission one step: kick-off, then status polls until the
+    /// receipts arrive, then the records' dispositions and the objects' archive.
+    async fn poll_submissions(&self) -> Result<()> {
+        let Some(bulk) = &self.bulk else {
+            return Ok(());
+        };
+        for sub in self.db.submissions_due(&self.feed.id)? {
+            let step = match sub.status.as_str() {
+                "kickoff" => {
+                    match bulk
+                        .kickoff(
+                            &self.feed.id,
+                            &sub.submission_id,
+                            &bulk.manifest_url(&sub.token),
+                        )
+                        .await
+                    {
+                        Ok(()) => match bulk.status_url(&self.feed.id, &sub.submission_id).await {
+                            Ok(url) => Ok(Some(("running", Some(url)))),
+                            Err(e) => Err(e),
+                        },
+                        // HFS already holds this drop: a repeat of the same files.
+                        Err(SendError::Refused(409, _)) => {
+                            match bulk.status_url(&self.feed.id, &sub.submission_id).await {
+                                Ok(url) => Ok(Some(("running", Some(url)))),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => match sub.status_url.as_deref() {
+                    None => Ok(Some(("kickoff", None))),
+                    Some(url) => match bulk.poll(url).await {
+                        Ok(Poll::InProgress) => Ok(None),
+                        Ok(Poll::Done { references, errors }) => {
+                            self.settle(&sub.token, &references, &errors).await?;
+                            Ok(Some(("done", None)))
+                        }
+                        Err(e) => Err(e),
+                    },
+                },
+            };
+            match step {
+                Ok(None) => {
+                    self.db.update_submission(
+                        &sub.token,
+                        &sub.status,
+                        None,
+                        sub.attempts,
+                        now_ms() + 2000,
+                        None,
+                    )?;
+                }
+                Ok(Some((status, url))) => {
+                    self.db
+                        .update_submission(&sub.token, status, url.as_deref(), 0, 0, None)?;
+                    if status == "done" && self.outage_alerted.swap(false, Ordering::SeqCst) {
+                        self.alerts.raise(
+                            Some(&self.feed.id),
+                            "delivery_recovered",
+                            &format!("{}: delivery to HFS recovered", self.feed.name),
+                        )?;
+                    }
+                }
+                Err(SendError::Refused(status, body)) => {
+                    let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
+                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
+                    for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
+                        self.db
+                            .mark_rejected(record_id, "server", &reason, Some(&body))?;
+                    }
+                    self.db.update_submission(
+                        &sub.token,
+                        "failed",
+                        None,
+                        sub.attempts,
+                        0,
+                        Some(&reason),
+                    )?;
+                    self.archive_submission(&sub.token).await?;
+                }
+                Err(SendError::Transient(reason)) => {
+                    let attempts = sub.attempts + 1;
+                    let d = &self.feed.delivery;
+                    let backoff = d
+                        .initial_backoff_ms
+                        .saturating_mul(1u64 << (attempts - 1).min(20))
+                        .min(d.max_backoff_ms);
+                    self.db.update_submission(
+                        &sub.token,
+                        &sub.status,
+                        None,
+                        attempts,
+                        now_ms() + backoff as i64,
+                        Some(&reason),
+                    )?;
+                    if attempts >= d.alert_after_attempts
+                        && !self.outage_alerted.swap(true, Ordering::SeqCst)
+                    {
+                        self.alerts.raise(
+                            Some(&self.feed.id),
+                            "delivery",
+                            &format!("{}: cannot deliver to HFS after {attempts} attempts ({reason}); data is kept and retried", self.feed.name),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives every submitted record its disposition from the receipts, then archives
+    /// the objects HFS has read.
+    async fn settle(
+        &self,
+        token: &str,
+        references: &std::collections::HashSet<String>,
+        errors: &[String],
+    ) -> Result<()> {
+        let hint = match errors.len() {
+            0 => String::new(),
+            n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
+        };
+        for (record_id, _, resources) in self.db.submitted_records(token)? {
+            let reference = resources
+                .get(0)
+                .and_then(|r| transform::check_resource(r).ok())
+                .map(|key| fhir::request_url(&key));
+            match reference {
+                Some(r) if references.contains(&r) => {
+                    self.db
+                        .mark_sent(record_id, &json!([{"reference": r, "via": "$bulk-submit"}]))?;
+                }
+                _ => self.db.mark_rejected(
+                    record_id,
+                    "server",
+                    &format!("no receipt from HFS for this resource.{hint}"),
+                    None,
+                )?,
+            }
+        }
+        self.archive_submission(token).await
+    }
+
+    async fn archive_submission(&self, token: &str) -> Result<()> {
+        let file_ids: Vec<i64> = {
+            let rows = self.db.query_json(
+                "SELECT DISTINCT file_id FROM records WHERE submission = ?1",
+                rusqlite::params![token],
+            )?;
+            rows.iter().filter_map(|r| r["file_id"].as_i64()).collect()
+        };
+        for file_id in file_ids {
+            if let Some((key, name)) = self.db.file_source(file_id)? {
+                self.source
+                    .acknowledge(&key, &format!("{file_id}-{name}"))
+                    .await?;
+                self.db.clear_file_source(file_id)?;
+            }
+        }
+        Ok(())
     }
 
     async fn deliver_due(&self) -> Result<()> {

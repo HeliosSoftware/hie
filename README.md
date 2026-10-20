@@ -82,6 +82,15 @@ expect_every: 24h            # alert when nothing arrives for this long
 
 An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO.
 
+### Delivery methods
+
+`delivery.method` picks how a source's records reach HFS:
+
+- **`rest`** (default): the transform runs on every record and the resources go out in `batch` Bundles, one `PUT` per record, with a status per entry. For anything that needs a transform, and for feeds of hundreds to tens of thousands of records at a time.
+- **`bulk_submit`**: for data that already is FHIR with ids, such as an NDJSON export. No transform runs. The engine stores the rows for the history, predicts what HFS will refuse (no `resourceType`, no `id`), and hands the **source objects themselves** to HFS through a `$bulk-submit` manifest it serves at `{public_url}/bulk/{token}/manifest.json`: pre-signed URLs for S3 objects, the engine's own `/bulk/{token}/files/{n}` for folder files. One submission per drop (up to `manifest_objects_max` objects), with a `submissionId` derived from the files so a repeated drop is refused by HFS instead of ingested twice. The engine polls the status URL, reads HFS's receipts (`{"reference": "Type/id"}` per stored resource, an `OperationOutcome` per failure) and maps them to its records by `Type/id`. Objects stay at the source until the receipts are in, then they are archived. `url_ttl_seconds` bounds how long the URLs stay valid.
+
+`public_url` in `hie.yaml` must be the URL HFS reaches the engine at.
+
 The same document is what `POST /api/sources` takes. Before creating one, `POST /api/sources/test` with `{"source": {...}}` lists the connection once and answers with the evidence: reachable or not, in how many milliseconds, how many objects match, and the newest one.
 
 ## Transforms

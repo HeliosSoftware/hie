@@ -125,6 +125,8 @@ jobs:
           DEPLOY_PORT: ${{ secrets.HIE_DEPLOY_PORT || 22 }}
           # The HFS this engine delivers to. Public HFS by default.
           HIE_FHIR_BASE_URL: ${{ secrets.HIE_FHIR_BASE_URL || 'https://hfs.heliossoftware.com' }}
+          # Where HFS reaches this engine: $bulk-submit manifests are served from it.
+          HIE_PUBLIC_URL: ${{ secrets.HIE_PUBLIC_URL || 'https://hie.heliossoftware.com' }}
           # Bearer-token validation for the API: the identity provider's JWKS and
           # issuer. Unset on the public sandbox, which is open like the public HFS;
           # set in a secure environment.
@@ -144,6 +146,7 @@ jobs:
           # archive carries are the examples; what the API creates lands next to them.
           cat > extracted/hie.yaml <<EOF
           fhir_base_url: $HIE_FHIR_BASE_URL
+          public_url: $HIE_PUBLIC_URL
           database: data/hie.db
           listen: 0.0.0.0:8090
           sources_dir: sources

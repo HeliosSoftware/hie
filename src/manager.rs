@@ -42,6 +42,8 @@ struct Managed {
 pub struct SourceManager {
     python: String,
     runtime_dir: PathBuf,
+    fhir_base_url: String,
+    public_url: String,
     sources_dir: PathBuf,
     transforms_dir: PathBuf,
     base_dir: PathBuf,
@@ -62,6 +64,8 @@ impl SourceManager {
         Arc::new(Self {
             python: config.python.clone(),
             runtime_dir: runtime_dir.to_path_buf(),
+            fhir_base_url: config.fhir_base_url.clone(),
+            public_url: config.public_url.clone(),
             sources_dir: config.sources_dir.clone(),
             transforms_dir: config.transforms_dir.clone(),
             base_dir: config.base_dir.clone(),
@@ -81,6 +85,8 @@ impl SourceManager {
             self.alerts.clone(),
             &self.python,
             &self.runtime_dir,
+            &self.fhir_base_url,
+            &self.public_url,
         )?);
         let control = Arc::new(RunnerControl::default());
         tokio::spawn(runner.clone().run(control.clone()));

@@ -54,8 +54,30 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/metrics", get(metrics))
+        // What HFS fetches during a $bulk-submit: the manifest, and the objects of
+        // sources that cannot sign URLs. The token in the path is unguessable.
+        .route("/bulk/{token}/manifest.json", get(bulk_manifest))
+        .route("/bulk/{token}/files/{file_id}", get(bulk_file))
         .merge(api)
         .with_state(state)
+}
+
+async fn bulk_manifest(State(s): State<AppState>, Path(token): Path<String>) -> ApiResult {
+    let submission =
+        s.db.submission(&token)?
+            .ok_or_else(|| not_found("submission"))?;
+    Ok(Json(submission.manifest))
+}
+
+async fn bulk_file(
+    State(s): State<AppState>,
+    Path((token, file_id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let key =
+        s.db.submission_file(&token, file_id)?
+            .ok_or_else(|| not_found("file"))?;
+    let bytes = tokio::fs::read(&key).await.map_err(|_| not_found("file"))?;
+    Ok(([(header::CONTENT_TYPE, "application/fhir+ndjson")], bytes).into_response())
 }
 
 const ISO: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', {}/1000.0, 'unixepoch')";
@@ -529,7 +551,7 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
     out.push_str("# TYPE hie_records gauge\n");
     for f in &sources {
         if let Value::Object(counts) = s.db.feed_counts(&f.id)? {
-            for status in ["received", "pending", "sent", "rejected"] {
+            for status in ["received", "pending", "submitted", "sent", "rejected"] {
                 let n = counts.get(status).and_then(Value::as_i64).unwrap_or(0);
                 out.push_str(&format!(
                     "hie_records{{source=\"{}\",status=\"{status}\"}} {n}\n",

@@ -94,6 +94,8 @@ async fn an_ndjson_object_is_delivered_by_id_and_archived() {
         Arc::new(Alerter::new(db.clone(), None)),
         python,
         &repo.join("hie_runtime"),
+        &base,
+        "http://127.0.0.1:0",
     );
     runner.tick().await.unwrap();
 

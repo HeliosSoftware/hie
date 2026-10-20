@@ -4,6 +4,7 @@
 pub mod alerts;
 pub mod api;
 pub mod auth;
+pub mod bulk;
 pub mod config;
 pub mod db;
 pub mod fhir;

@@ -54,7 +54,49 @@ CREATE TABLE IF NOT EXISTS source_state (
   paused_at INTEGER,
   paused_by TEXT
 );
+CREATE TABLE IF NOT EXISTS submissions (
+  token TEXT PRIMARY KEY,
+  feed_id TEXT NOT NULL,
+  submission_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  manifest TEXT NOT NULL,
+  status_url TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, status, next_attempt_at);
 ";
+
+/// Columns added after the first schema; each is added when missing.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("files", "source_key", "TEXT"),
+    ("records", "submission", "TEXT"),
+];
+
+/// A `$bulk-submit` submission the engine handed to HFS and is waiting on.
+#[derive(Debug, Clone)]
+pub struct Submission {
+    pub token: String,
+    pub feed_id: String,
+    pub submission_id: String,
+    pub status: String,
+    pub manifest: Value,
+    pub status_url: Option<String>,
+    pub attempts: u32,
+}
+
+/// A file with records waiting to be submitted, and what they are.
+#[derive(Debug, Clone)]
+pub struct SubmittableFile {
+    pub file_id: i64,
+    pub name: String,
+    pub source_key: Option<String>,
+    /// (record id, resource type) for every pending record of the file.
+    pub records: Vec<(i64, String)>,
+}
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -104,6 +146,19 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(SCHEMA)?;
+        for (table, column, kind) in ADDED_COLUMNS {
+            let exists = conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(Result::ok)
+                .any(|c| c == *column);
+            if !exists {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                    [],
+                )?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -125,6 +180,9 @@ impl Db {
         })
     }
 
+    /// Records a file. `source_key` is kept when the object must stay at its source
+    /// until HFS has fetched it (the `$bulk-submit` path).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
         feed: &str,
@@ -133,14 +191,203 @@ impl Db {
         size: u64,
         status: &str,
         duplicate_of: Option<i64>,
+        source_key: Option<&str>,
     ) -> Result<i64> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CASE WHEN ?5 = 'processing' THEN NULL ELSE ?7 END)",
-                params![feed, name, sha, size as i64, status, duplicate_of, now_ms()],
+                "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CASE WHEN ?5 = 'processing' THEN NULL ELSE ?7 END, ?8)",
+                params![feed, name, sha, size as i64, status, duplicate_of, now_ms(), source_key],
             )?;
             Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn file_source(&self, file_id: i64) -> Result<Option<(String, String)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT source_key, name FROM files WHERE id = ?1 AND source_key IS NOT NULL",
+                params![file_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+    }
+
+    pub fn clear_file_source(&self, file_id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE files SET source_key = NULL WHERE id = ?1",
+                params![file_id],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Files of a feed with pending records that no submission holds yet.
+    pub fn submittable_files(&self, feed: &str, limit: usize) -> Result<Vec<SubmittableFile>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT r.id, r.file_id, f.name, f.source_key, r.resources
+                 FROM records r JOIN files f ON f.id = r.file_id
+                 WHERE r.feed_id = ?1 AND r.status = 'pending' AND r.submission IS NULL
+                 ORDER BY r.file_id, r.id",
+            )?;
+            let mut files: Vec<SubmittableFile> = Vec::new();
+            let rows = stmt.query_map(params![feed], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (record_id, file_id, name, source_key, resources) = row?;
+                let resource_type = resources
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get(0)
+                            .and_then(|r| r.get("resourceType"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                match files.last_mut() {
+                    Some(f) if f.file_id == file_id => f.records.push((record_id, resource_type)),
+                    _ => {
+                        if files.len() >= limit {
+                            break;
+                        }
+                        files.push(SubmittableFile {
+                            file_id,
+                            name,
+                            source_key,
+                            records: vec![(record_id, resource_type)],
+                        });
+                    }
+                }
+            }
+            Ok(files)
+        })
+    }
+
+    /// Opens a submission over the given records, which move to `submitted`.
+    pub fn create_submission(
+        &self,
+        token: &str,
+        feed: &str,
+        submission_id: &str,
+        manifest: &Value,
+        record_ids: &[i64],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        let tx = conn.transaction()?;
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'kickoff', ?4, ?5, ?5)",
+            params![token, feed, submission_id, manifest.to_string(), now],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE records SET status = 'submitted', submission = ?2, updated_at = ?3 WHERE id = ?1",
+            )?;
+            for id in record_ids {
+                stmt.execute(params![id, token, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn submissions(&self, sql: &str, p: impl Params) -> Result<Vec<Submission>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(sql)?;
+            let rows = stmt.query_map(p, |r| {
+                let manifest: String = r.get(4)?;
+                Ok(Submission {
+                    token: r.get(0)?,
+                    feed_id: r.get(1)?,
+                    submission_id: r.get(2)?,
+                    status: r.get(3)?,
+                    manifest: serde_json::from_str(&manifest).unwrap_or(Value::Null),
+                    status_url: r.get(5)?,
+                    attempts: r.get::<_, i64>(6)? as u32,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    pub fn submission(&self, token: &str) -> Result<Option<Submission>> {
+        Ok(self
+            .submissions(
+                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts FROM submissions WHERE token = ?1",
+                params![token],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// Open submissions of a feed whose next attempt is due.
+    pub fn submissions_due(&self, feed: &str) -> Result<Vec<Submission>> {
+        self.submissions(
+            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts FROM submissions
+             WHERE feed_id = ?1 AND status IN ('kickoff', 'running') AND next_attempt_at <= ?2 ORDER BY created_at",
+            params![feed, now_ms()],
+        )
+    }
+
+    pub fn update_submission(
+        &self,
+        token: &str,
+        status: &str,
+        status_url: Option<&str>,
+        attempts: u32,
+        next_attempt_at: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE submissions SET status = ?2, status_url = COALESCE(?3, status_url), attempts = ?4,
+                        next_attempt_at = ?5, error = ?6, updated_at = ?7 WHERE token = ?1",
+                params![token, status, status_url, attempts as i64, next_attempt_at, error, now_ms()],
+            )
+            .map(drop)
+        })
+    }
+
+    /// The records a submission holds: (record id, file id, resources).
+    pub fn submitted_records(&self, token: &str) -> Result<Vec<(i64, i64, Value)>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, file_id, resources FROM records WHERE submission = ?1 AND status = 'submitted' ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![token], |r| {
+                let resources: Option<String> = r.get(2)?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    resources.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null),
+                ))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// The source key of a file, only when that file is part of the submission.
+    pub fn submission_file(&self, token: &str, file_id: i64) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT f.source_key FROM files f
+                 WHERE f.id = ?2 AND f.source_key IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.submission = ?1)",
+                params![token, file_id],
+                |r| r.get(0),
+            )
+            .optional()
         })
     }
 
@@ -312,7 +559,7 @@ impl Db {
                  FROM files f LEFT JOIN records r ON r.file_id = f.id
                  WHERE f.feed_id = ?1 AND f.status = 'processing'
                  GROUP BY f.id
-                 HAVING COALESCE(SUM(r.status IN ('received', 'pending')), 0) = 0",
+                 HAVING COALESCE(SUM(r.status IN ('received', 'pending', 'submitted')), 0) = 0",
             )?;
             let mut done: Vec<FinishedFile> = stmt
                 .query_map(params![feed], |r| {
@@ -406,7 +653,7 @@ impl Db {
     pub fn feed_counts(&self, feed: &str) -> Result<Value> {
         self.with(|c| {
             let mut counts = Map::new();
-            for status in ["received", "pending", "sent", "rejected"] {
+            for status in ["received", "pending", "submitted", "sent", "rejected"] {
                 counts.insert(status.into(), json!(0));
             }
             let mut stmt = c.prepare(

@@ -8,6 +8,7 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
+use object_store::signer::Signer;
 use serde::Serialize;
 
 use crate::config::{FeedConfig, SourceConfig, glob_match};
@@ -63,16 +64,21 @@ impl Source {
                         .with_allow_http(true)
                         .with_virtual_hosted_style_request(false);
                 }
-                let store = builder
-                    .build()
-                    .with_context(|| format!("feed {}: S3 source", feed.id))?;
-                Source::Object(ObjectSource::new(
-                    Arc::new(store),
-                    prefix,
-                    archive_prefix,
-                    pattern,
-                    Duration::from_millis(*min_file_age_ms),
-                ))
+                let store = Arc::new(
+                    builder
+                        .build()
+                        .with_context(|| format!("feed {}: S3 source", feed.id))?,
+                );
+                Source::Object(
+                    ObjectSource::new(
+                        store.clone(),
+                        prefix,
+                        archive_prefix,
+                        pattern,
+                        Duration::from_millis(*min_file_age_ms),
+                    )
+                    .with_signer(store),
+                )
             }
         })
     }
@@ -168,6 +174,8 @@ impl FolderSource {
 /// Acknowledged objects are renamed under the archive prefix.
 pub struct ObjectSource {
     store: Arc<dyn ObjectStore>,
+    /// Mints pre-signed URLs; set for S3, absent for stores that cannot sign.
+    signer: Option<Arc<dyn Signer>>,
     prefix: Option<ObjectPath>,
     archive: ObjectPath,
     pattern: String,
@@ -185,6 +193,7 @@ impl ObjectSource {
         let prefix = prefix.trim_matches('/');
         Self {
             store,
+            signer: None,
             prefix: (!prefix.is_empty()).then(|| ObjectPath::from(prefix)),
             archive: ObjectPath::from(archive_prefix.trim_matches('/')),
             pattern: pattern.to_string(),
@@ -241,6 +250,34 @@ impl ObjectSource {
             .await
             .with_context(|| format!("archiving {key}"))?;
         Ok(())
+    }
+}
+
+impl ObjectSource {
+    pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+}
+
+impl Source {
+    /// A URL a third party (HFS) can read the object from for `ttl`: a pre-signed
+    /// GET on S3. `None` when the source cannot sign, and the engine serves the
+    /// object itself.
+    pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
+        match self {
+            Source::Folder(_) => Ok(None),
+            Source::Object(o) => match &o.signer {
+                None => Ok(None),
+                Some(signer) => {
+                    let url = signer
+                        .signed_url(http::Method::GET, &ObjectPath::from(key), ttl)
+                        .await
+                        .with_context(|| format!("signing a URL for {key}"))?;
+                    Ok(Some(url.to_string()))
+                }
+            },
+        }
     }
 }
 
