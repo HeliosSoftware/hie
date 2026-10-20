@@ -209,6 +209,19 @@ With `HIE_AUTH_ENABLED=true`, every request under `/api` needs a bearer token si
 
 With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` writes code the engine then runs, so an open API must only be reachable from trusted clients. Scopes are not enforced yet: any valid token from the issuer may do everything.
 
+### The engine's identity towards HFS
+
+The engine calls HFS as itself, with an OAuth2 **client-credentials** grant at the identity provider's token endpoint (Keycloak first; the same providers HFS accepts). The token is cached and renewed a minute before it expires; a `401` or `403` from HFS discards it, the rows wait, and the next pass goes out with a fresh one. A token endpoint that cannot be reached or refuses the client is a transient delivery failure, so the data is kept and the outage alerts say why. A wrong endpoint or secret fails at startup.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HIE_FHIR_TOKEN_URL` | | The provider's token endpoint, e.g. `https://idp/realms/hfs/protocol/openid-connect/token` |
+| `HIE_FHIR_CLIENT_ID` | | The engine's client |
+| `HIE_FHIR_CLIENT_SECRET` | | Its secret |
+| `HIE_FHIR_SCOPE` | | Scopes to ask for, when the provider needs them, e.g. `system/*.cruds` |
+
+With none of them set the engine calls HFS anonymously and logs a warning at start, which is what the public sandbox does against the public HFS. Setting some but not all three is refused.
+
 ## Release and deploy
 
 A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the HFS release chain (see [RELEASING.md](RELEASING.md) for how to cut one):
@@ -218,7 +231,7 @@ A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the H
 3. **Image**: `ghcr.io/heliossoftware/hie:{version}`, `:{major.minor}`, `:sha-{sha}`, and `:latest` for a non-prerelease.
 4. **Deploy**: from the `Deploy` runner over SSH to the host behind `hie.heliossoftware.com`: the binary and runtime go to `/opt/hie`, a systemd unit `hie` runs it on `0.0.0.0:8090`, and the job fails unless `/health` answers. `data/` and anything created through the API in `sources/` and `transforms/` survive a deploy.
 
-Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional) and `HIE_FHIR_BASE_URL` (defaults to the public HFS). The public sandbox at `hie.heliossoftware.com` is deployed open, like the public HFS: a place to show the work and run demos, with nothing sensitive on it. A secure environment adds `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER` and `HIE_AUTH_AUDIENCE`, which the deploy writes to the root-only `/etc/hie/hie.env` on the host.
+Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional) and `HIE_FHIR_BASE_URL` (defaults to the public HFS). The public sandbox at `hie.heliossoftware.com` is deployed open, like the public HFS: a place to show the work and run demos, with nothing sensitive on it. A secure environment adds `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER` and `HIE_AUTH_AUDIENCE` for the API, and `HIE_FHIR_TOKEN_URL`, `HIE_FHIR_CLIENT_ID`, `HIE_FHIR_CLIENT_SECRET` (and `HIE_FHIR_SCOPE`) for the engine's calls to HFS; the deploy writes them to the root-only `/etc/hie/hie.env` on the host.
 
 ## Layout
 

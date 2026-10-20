@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::credentials::Credentials;
 use crate::fhir::{self, SendError};
 
 /// What a status poll found.
@@ -29,6 +30,7 @@ pub struct BulkSubmitter {
     http: reqwest::Client,
     fhir_base: String,
     public_url: String,
+    credentials: Credentials,
 }
 
 /// The identifier system the engine submits under; the value is the source id.
@@ -44,7 +46,14 @@ impl BulkSubmitter {
             http,
             fhir_base: fhir_base.trim_end_matches('/').to_string(),
             public_url: public_url.trim_end_matches('/').to_string(),
+            credentials: None,
         }
+    }
+
+    /// The same submitter, calling HFS with the engine's token.
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
+        self
     }
 
     pub fn manifest_url(&self, token: &str) -> String {
@@ -82,21 +91,36 @@ impl BulkSubmitter {
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<reqwest::Response, SendError> {
-        self.http
+        let request = self
+            .http
             .post(format!("{}/{path}", self.fhir_base))
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
-            .json(body)
+            .json(body);
+        fhir::authorize(request, &self.credentials)
+            .await?
             .send()
             .await
             .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.fhir_base)))
     }
 
-    async fn classify(response: reqwest::Response) -> Result<reqwest::Response, SendError> {
+    async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response, SendError> {
+        let request = self.http.get(url).header("Accept", accept);
+        fhir::authorize(request, &self.credentials)
+            .await?
+            .send()
+            .await
+            .map_err(|e| SendError::Transient(format!("fetching {url}: {e}")))
+    }
+
+    async fn classify(&self, response: reqwest::Response) -> Result<reqwest::Response, SendError> {
         let status = response.status().as_u16();
         match status {
             200..=299 => Ok(response),
             429 | 500..=599 => Err(SendError::Transient(format!("HTTP {status}"))),
+            401 | 403 if self.credentials.is_some() => {
+                Err(fhir::refused_token(status, &self.credentials).await)
+            }
             _ => {
                 let body: Value = response.json().await.unwrap_or(Value::Null);
                 Err(SendError::Refused(status, body))
@@ -120,7 +144,8 @@ impl BulkSubmitter {
                 json!({"name": "submissionStatus", "valueCoding": {"system": "http://hl7.org/fhir/event-status", "code": "completed"}}),
             ],
         );
-        Self::classify(self.post("$bulk-submit", &body).await?).await?;
+        self.classify(self.post("$bulk-submit", &body).await?)
+            .await?;
         Ok(())
     }
 
@@ -131,7 +156,9 @@ impl BulkSubmitter {
         submission_id: &str,
     ) -> Result<String, SendError> {
         let body = Self::parameters(source_id, submission_id, vec![]);
-        let response = Self::classify(self.post("$bulk-submit-status", &body).await?).await?;
+        let response = self
+            .classify(self.post("$bulk-submit-status", &body).await?)
+            .await?;
         response
             .headers()
             .get("content-location")
@@ -149,16 +176,13 @@ impl BulkSubmitter {
         let mut errors = Vec::new();
         let mut next = Some(status_url.to_string());
         while let Some(url) = next.take() {
-            let response = self
-                .http
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| SendError::Transient(format!("polling {url}: {e}")))?;
+            let response = self.get(&url, "application/json").await?;
             match response.status().as_u16() {
                 202 | 429 => return Ok(Poll::InProgress),
                 200 => {}
+                status @ (401 | 403) if self.credentials.is_some() => {
+                    return Err(fhir::refused_token(status, &self.credentials).await);
+                }
                 status @ (500..=599) => {
                     return Err(SendError::Transient(format!("HTTP {status} polling {url}")));
                 }
@@ -200,11 +224,8 @@ impl BulkSubmitter {
 
     async fn lines(&self, url: &str) -> Result<Vec<Value>, SendError> {
         let text = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| SendError::Transient(format!("fetching {url}: {e}")))?
+            .get(url, "application/fhir+ndjson, application/x-ndjson, */*")
+            .await?
             .error_for_status()
             .map_err(|e| SendError::Transient(format!("fetching {url}: {e}")))?
             .text()

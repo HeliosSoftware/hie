@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod bulk;
 pub mod config;
+pub mod credentials;
 pub mod db;
 pub mod fhir;
 pub mod manager;
@@ -26,9 +27,13 @@ pub fn build(
     feeds: Vec<config::FeedConfig>,
     runtime_dir: &Path,
     auth: auth::Auth,
+    credentials: credentials::Credentials,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::open(&config.database)?);
-    let fhir = Arc::new(fhir::FhirClient::new(&config.fhir_base_url));
+    let fhir = Arc::new(fhir::FhirClient::with_credentials(
+        &config.fhir_base_url,
+        credentials,
+    ));
     let alerts = Arc::new(alerts::Alerter::new(
         db.clone(),
         config.alerts.webhook_url.clone(),

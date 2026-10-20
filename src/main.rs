@@ -69,7 +69,25 @@ async fn main() -> Result<()> {
             "API authentication is off (HIE_AUTH_ENABLED is not true): anyone who can reach the API can change sources and transforms"
         ),
     }
-    let (_manager, state) = hie::build(&config, feeds, &runtime_dir, auth)?;
+    let credentials = match hie::credentials::CredentialSettings::from_env()? {
+        Some(settings) => {
+            let source = hie::credentials::TokenSource::new(settings);
+            source.check().await?;
+            tracing::info!(
+                client = source.client_id(),
+                "calling HFS as the engine: token from {}",
+                source.settings().token_url
+            );
+            Some(std::sync::Arc::new(source))
+        }
+        None => {
+            tracing::warn!(
+                "calling HFS anonymously (HIE_FHIR_TOKEN_URL, HIE_FHIR_CLIENT_ID and HIE_FHIR_CLIENT_SECRET are not set)"
+            );
+            None
+        }
+    };
+    let (_manager, state) = hie::build(&config, feeds, &runtime_dir, auth, credentials)?;
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;

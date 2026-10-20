@@ -70,7 +70,8 @@ async fn lab(python: &str) -> Lab {
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
     let created = http

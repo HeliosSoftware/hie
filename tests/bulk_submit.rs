@@ -211,7 +211,8 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
     manager.pause("exports", None).unwrap(); // the test drives the passes itself
     let runner = manager.runner("exports").unwrap();
     let db = state.db.clone();

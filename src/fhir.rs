@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::credentials::Credentials;
+
 /// Why a Bundle could not be delivered as a whole.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendError {
@@ -22,10 +24,16 @@ pub enum EntryResult {
 pub struct FhirClient {
     base: String,
     http: reqwest::Client,
+    credentials: Credentials,
 }
 
 impl FhirClient {
+    /// A client that calls HFS anonymously.
     pub fn new(base: &str) -> Self {
+        Self::with_credentials(base, None)
+    }
+
+    pub fn with_credentials(base: &str, credentials: Credentials) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -33,16 +41,23 @@ impl FhirClient {
         Self {
             base: base.trim_end_matches('/').to_string(),
             http,
+            credentials,
         }
     }
 
+    pub fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
-        let resp = self
+        let request = self
             .http
             .post(&self.base)
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
-            .json(bundle)
+            .json(bundle);
+        let resp = authorize(request, &self.credentials)
+            .await?
             .send()
             .await
             .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.base)))?;
@@ -54,9 +69,34 @@ impl FhirClient {
                 "HTTP {status} from {}",
                 self.base
             ))),
+            401 | 403 if self.credentials.is_some() => {
+                Err(refused_token(status, &self.credentials).await)
+            }
             _ => Err(SendError::Refused(status, body)),
         }
     }
+}
+
+/// Adds the engine's bearer token to a request towards HFS, when it has one.
+pub async fn authorize(
+    request: reqwest::RequestBuilder,
+    credentials: &Credentials,
+) -> Result<reqwest::RequestBuilder, SendError> {
+    match credentials {
+        Some(source) => Ok(request.bearer_auth(source.bearer().await?)),
+        None => Ok(request),
+    }
+}
+
+/// HFS did not accept the engine's token: forget it and try again later with a
+/// fresh one. The data waits rather than being rejected.
+pub async fn refused_token(status: u16, credentials: &Credentials) -> SendError {
+    if let Some(source) = credentials {
+        source.invalidate().await;
+    }
+    SendError::Transient(format!(
+        "HTTP {status}: HFS did not accept the engine's token; a new one will be requested"
+    ))
 }
 
 /// Encodes a search value for a conditional URL, keeping the `|` separator literal.

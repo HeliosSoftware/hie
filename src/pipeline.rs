@@ -82,8 +82,10 @@ impl FeedRunner {
         public_url: &str,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
-        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit)
-            .then(|| BulkSubmitter::new(fhir_base_url, public_url));
+        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
+            BulkSubmitter::new(fhir_base_url, public_url)
+                .with_credentials(fhir.credentials().clone())
+        });
         Self {
             feed,
             source,

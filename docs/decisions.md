@@ -232,7 +232,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - The same crate and the same claims as HFS mean one identity provider, one token, and the same `HFS_AUTH_*`-shaped settings an operator already knows.
 - The subject of the token is what the UI's "paused by" needs, so it is recorded.
 
-**Not yet:** scopes and roles (any valid token from the issuer may do everything); the engine's own credentials for calling HFS (client credentials); per-user audit of changes.
+**Not yet:** scopes and roles (any valid token from the issuer may do everything); per-user audit of changes. The engine's own credentials for calling HFS are decision 23.
 
 ## 21. `$bulk-submit` points HFS at the source objects, and receipts map by `Type/id`
 
@@ -260,12 +260,23 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Cost / not yet:** `email` is recorded but not sent; the webhook is still the one outward channel. Recipients are free text; nothing resolves them against the identity provider. Rules are evaluated once per pass of the source, so a `silence` or `missing_by` alert is late by up to one poll interval.
 
+## 23. The engine calls HFS with its own client-credentials token
+
+**Chosen:** `HIE_FHIR_TOKEN_URL`, `HIE_FHIR_CLIENT_ID`, `HIE_FHIR_CLIENT_SECRET` and an optional `HIE_FHIR_SCOPE` name an OAuth2 client at the identity provider. One token source serves every request the engine makes to HFS: batch Bundles, `$bulk-submit` kick-offs, status polls and receipt files. The token is cached and renewed a minute before expiry; a `401`/`403` from HFS discards it and is treated as a transient failure, like an outage. Absent settings mean anonymous calls, with a warning at start; partial settings are refused.
+
+**Why:**
+- Any environment beyond the public sandbox has an HFS that requires a token; without this the engine could only deliver to the open one.
+- Client credentials is what Keycloak, Entra ID and Okta all offer for a service identity, and what HFS validates today; the same token source will take a private-key JWT (SMART backend services) when HFS asks for one.
+- A refused token must not reject the data. It is the same situation as HFS being down: wait, retry, and tell someone.
+
+**Not yet:** private-key JWT instead of a shared secret; a token per tenant when one engine serves several; scopes narrowed per source.
+
 ## Not in the prototype
 
 - Connectors besides a folder and S3: database, another FHIR server.
 - HL7v2 input.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
-- Authentication to HFS (SMART backend services).
+- Authentication to HFS with a private-key JWT (SMART backend services); client credentials are in.
 - `$bulk-submit` delivery (HFS fetches a manifest and NDJSON files, which can live on S3).
 - PostgreSQL, multiple instances, a UI, FHIR Mapping Language.

@@ -96,7 +96,8 @@ async fn engine(auth: hie::auth::Auth) -> (String, tempfile::TempDir) {
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), auth).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), auth, None).unwrap();
     (serve(hie::api::router(state)).await, dir)
 }
 

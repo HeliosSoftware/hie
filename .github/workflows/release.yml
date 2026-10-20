@@ -140,6 +140,13 @@ jobs:
           HIE_AUTH_JWKS_URL: ${{ secrets.HIE_AUTH_JWKS_URL }}
           HIE_AUTH_ISSUER: ${{ secrets.HIE_AUTH_ISSUER }}
           HIE_AUTH_AUDIENCE: ${{ secrets.HIE_AUTH_AUDIENCE }}
+          # The engine's own identity towards HFS: a client-credentials grant at
+          # the identity provider. Unset on the public sandbox (the public HFS
+          # takes anonymous writes); set in a secure environment.
+          HIE_FHIR_TOKEN_URL: ${{ secrets.HIE_FHIR_TOKEN_URL }}
+          HIE_FHIR_CLIENT_ID: ${{ secrets.HIE_FHIR_CLIENT_ID }}
+          HIE_FHIR_CLIENT_SECRET: ${{ secrets.HIE_FHIR_CLIENT_SECRET }}
+          HIE_FHIR_SCOPE: ${{ secrets.HIE_FHIR_SCOPE }}
         run: |
           set -eu
           SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -185,7 +192,14 @@ jobs:
               $SSH "sudo sh -c 'umask 077; mkdir -p /etc/hie; cat > /etc/hie/hie.env'"
           else
             echo "HIE_AUTH_JWKS_URL and HIE_AUTH_ISSUER are not set: deploying with the API open (the public sandbox)"
-            $SSH "sudo sh -c 'mkdir -p /etc/hie; : > /etc/hie/hie.env'"
+            $SSH "sudo sh -c 'umask 077; mkdir -p /etc/hie; : > /etc/hie/hie.env'"
+          fi
+          if [ -n "$HIE_FHIR_TOKEN_URL" ] && [ -n "$HIE_FHIR_CLIENT_ID" ] && [ -n "$HIE_FHIR_CLIENT_SECRET" ]; then
+            printf 'HIE_FHIR_TOKEN_URL=%s\nHIE_FHIR_CLIENT_ID=%s\nHIE_FHIR_CLIENT_SECRET=%s\nHIE_FHIR_SCOPE=%s\n' \
+              "$HIE_FHIR_TOKEN_URL" "$HIE_FHIR_CLIENT_ID" "$HIE_FHIR_CLIENT_SECRET" "$HIE_FHIR_SCOPE" | \
+              $SSH "sudo sh -c 'umask 077; cat >> /etc/hie/hie.env'"
+          else
+            echo "HIE_FHIR_TOKEN_URL, HIE_FHIR_CLIENT_ID and HIE_FHIR_CLIENT_SECRET are not all set: the engine calls HFS anonymously"
           fi
 
           $SSH "sudo tee /etc/systemd/system/hie.service > /dev/null <<EOF
