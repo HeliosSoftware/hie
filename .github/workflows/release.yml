@@ -17,7 +17,7 @@ jobs:
     name: Build Release (Linux x86_64)
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Version
@@ -37,7 +37,7 @@ jobs:
           cp -r hie_runtime transforms sources examples "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
           sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: hie-${{ env.TARGET }}
           path: |
@@ -51,10 +51,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: hie-${{ env.TARGET }}
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             hie-*.tar.gz
@@ -74,7 +74,7 @@ jobs:
         run: |
           echo "::error::DOCKER_HOST secret is not set. The image is built on the shared Docker server."
           exit 1
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Version
         id: version
         run: |
@@ -83,13 +83,13 @@ jobs:
           echo "major_minor=${V%.*}" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "latest=$([[ "$V" == *-* ]] && echo false || echo true)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -109,7 +109,7 @@ jobs:
     needs: [release, docker]
     steps:
       - name: Download release archive
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

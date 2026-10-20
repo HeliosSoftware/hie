@@ -14,7 +14,7 @@ jobs:
     name: Test (Linux)
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,7 +42,7 @@ jobs:
         run: |
           echo "::error::DOCKER_HOST secret is not set. The image is built on the shared Docker server."
           exit 1
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: docker build -t "$IMAGE" .
       - name: Smoke test
