@@ -215,6 +215,14 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Cost:** Two sources of truth for a definition while a process runs (the file and memory); the engine resolves it by re-reading the file when it reports a definition, and by rewriting the file before restarting a source. Concurrent edits of the same file by a person and the API are not arbitrated.
 
+## 19. Transforms and monitoring over the API, preliminary
+
+**Chosen:** Transforms are listed, read, saved and tried through `/api/transforms`; a save restarts the sources that use the transform. Monitoring is one aggregate (`/api/monitoring/status`) plus per-source day series (`/api/sources/{id}/stats`), both computed from the engine's store.
+
+**Why:** The client UI's Transforms and Monitoring modules need these to render anything, and the assessment in discussion #1 lists them as the next additions after sources. "Try it" reuses the same Python worker as a real load, so the test is the real thing.
+
+**Not yet:** transform versions and "used by since"; failures grouped by reason with the transform line; alert rules with recipients; authentication, without which saving a transform is remote code execution and the API must stay on a trusted network.
+
 ## Not in the prototype
 
 - Connectors besides a folder and S3: database, another FHIR server.

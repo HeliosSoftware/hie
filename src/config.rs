@@ -18,6 +18,9 @@ pub struct Config {
     /// through the API, so the definitions stay files under version control.
     #[serde(default = "default_sources_dir", alias = "feeds_dir")]
     pub sources_dir: PathBuf,
+    /// One Python file per transform; the API lists, edits and tries them here.
+    #[serde(default = "default_transforms_dir")]
+    pub transforms_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
@@ -136,6 +139,9 @@ fn default_python() -> String {
 fn default_sources_dir() -> PathBuf {
     PathBuf::from("sources")
 }
+fn default_transforms_dir() -> PathBuf {
+    PathBuf::from("transforms")
+}
 fn default_pattern() -> String {
     "*".into()
 }
@@ -241,6 +247,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     config.base_dir = base.clone();
     config.database = base.join(&config.database);
     config.sources_dir = base.join(&config.sources_dir);
+    config.transforms_dir = base.join(&config.transforms_dir);
     std::fs::create_dir_all(&config.sources_dir)
         .with_context(|| format!("creating {}", config.sources_dir.display()))?;
 

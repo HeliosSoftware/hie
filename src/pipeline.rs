@@ -82,6 +82,11 @@ impl FeedRunner {
         }
     }
 
+    /// When this runner started: the reference for silence until data arrives.
+    pub fn started_at(&self) -> i64 {
+        self.started_at
+    }
+
     /// The feed's loop: a pass every poll interval, or sooner when poked; nothing
     /// while the source is paused; until stopped.
     pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {

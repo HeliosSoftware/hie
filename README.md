@@ -118,12 +118,31 @@ def transform(record, context):
 | `POST /api/sources/{id}/resume` | Resumes and passes at once |
 | `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
 | `GET /api/sources/{id}/files` | Files received, with duplicates and per-file sent/rejected counts |
+| `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
+| `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
+| `GET /api/transforms/{name}` | The transform's code |
+| `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
+| `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason |
+| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
 | `GET /api/alerts?source=` | Alerts, newest first |
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok"}` |
+
+The API has no authentication yet. `PUT /api/transforms/{name}` writes code the engine then runs, so until bearer-token validation lands the API must only be reachable from trusted clients.
+
+## Release and deploy
+
+A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the HFS release chain:
+
+1. **Build**: the Linux x86_64 release binary, packaged with `hie_runtime/`, `transforms/`, `sources/` and `examples/` as `hie-{version}-x86_64-unknown-linux-gnu.tar.gz`.
+2. **Release**: a GitHub Release with the archive and its SHA-256.
+3. **Image**: `ghcr.io/heliossoftware/hie:{version}`, `:{major.minor}`, `:sha-{sha}`, and `:latest` for a non-prerelease.
+4. **Deploy**: from the `Deploy` runner over SSH to the host behind `hie.heliossoftware.com`: the binary and runtime go to `/opt/hie`, a systemd unit `hie` runs it on `0.0.0.0:8090`, and the job fails unless `/health` answers. `data/` and anything created through the API in `sources/` and `transforms/` survive a deploy.
+
+Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional), and `HIE_FHIR_BASE_URL` (defaults to the public HFS). Extra environment for the service can be put in `/etc/hie/hie.env` on the host.
 
 ## Layout
 

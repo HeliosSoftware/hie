@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::params;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config::FeedConfig;
 use crate::db::{Db, now_ms};
@@ -33,6 +33,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
         .route("/api/sources/{id}/files", get(list_files))
+        .route("/api/sources/{id}/stats", get(source_stats))
+        .route("/api/transforms", get(list_transforms))
+        .route(
+            "/api/transforms/{name}",
+            get(get_transform).put(put_transform),
+        )
+        .route("/api/transforms/{name}/try", post(try_transform))
+        .route("/api/monitoring/status", get(monitoring_status))
         .route("/api/records", get(list_records))
         .route("/api/records/{id}", get(get_record))
         .route("/api/records/{id}/reprocess", post(reprocess))
@@ -42,6 +50,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 const ISO: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', {}/1000.0, 'unixepoch')";
+const DAY_MS: i64 = 86_400_000;
 
 fn iso(col: &str) -> String {
     ISO.replace("{}", col)
@@ -74,8 +83,21 @@ impl From<ManagerError> for ApiError {
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
+fn not_found(what: &str) -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
+}
+
 fn iso_ms(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339())
+}
+
+fn count(db: &Db, sql: &str, p: impl rusqlite::Params) -> anyhow::Result<i64> {
+    Ok(db
+        .query_json(sql, p)?
+        .first()
+        .and_then(|r| r.get("n"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0))
 }
 
 /// A source's definition and its state, as one object.
@@ -83,10 +105,15 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
     let last = db.last_received_at(&feed.id)?;
     let paused = db.paused_state(&feed.id)?;
+    let started = s
+        .manager
+        .runner(&feed.id)
+        .map(|r| r.started_at())
+        .unwrap_or_else(now_ms);
     let freshness = match (feed.expect_every, last) {
         (None, _) => "not_monitored",
+        (Some(w), _) if now_ms() - last.unwrap_or(started) > w.as_millis() as i64 => "silent",
         (Some(_), None) => "no_data_yet",
-        (Some(w), Some(t)) if now_ms() - t > w.as_millis() as i64 => "silent",
         _ => "ok",
     };
     let state = match (&paused, freshness) {
@@ -98,6 +125,12 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let last_alert = db.query_json(
         &format!("SELECT kind, message, {} AS created_at FROM alerts WHERE feed_id = ?1 ORDER BY id DESC LIMIT 1", iso("created_at")),
         params![feed.id],
+    )?;
+    let since = now_ms() - DAY_MS;
+    let rejected_24h = count(
+        db,
+        "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'rejected' AND updated_at >= ?2",
+        params![feed.id, since],
     )?;
     Ok(json!({
         "id": feed.id,
@@ -112,6 +145,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "paused": paused.map(|(at, by)| json!({"since": iso_ms(at), "by": by})),
         "last_received_at": last.and_then(iso_ms),
         "records": db.feed_counts(&feed.id)?,
+        "rejected_last_24h": rejected_24h,
         "last_alert": last_alert.into_iter().next(),
         "definition": s.manager.definition(&feed.id)?,
     }))
@@ -128,10 +162,10 @@ async fn list_sources(State(s): State<AppState>) -> ApiResult {
 }
 
 async fn get_source(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    let feed = s.manager.source(&id).ok_or(ApiError(
-        StatusCode::NOT_FOUND,
-        format!("source {id} not found"),
-    ))?;
+    let feed = s
+        .manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
     Ok(Json(source_status(&s, &feed)?))
 }
 
@@ -196,6 +230,174 @@ async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiR
     Ok(Json(
         serde_json::to_value(probe).map_err(anyhow::Error::from)?,
     ))
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    days: Option<i64>,
+}
+
+/// What a source's page draws: today's numbers and one row per day for the last N days.
+async fn source_stats(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult {
+    s.manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
+    let days = q.days.unwrap_or(14).clamp(1, 366);
+    let today = chrono::Utc::now().date_naive();
+    let first = today - chrono::Days::new(days as u64 - 1);
+    let since = first
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    let mut by_day: Map<String, Value> = (0..days)
+        .map(|i| {
+            let day = (first + chrono::Days::new(i as u64)).to_string();
+            (day, json!({"files": 0, "sent": 0, "rejected": 0}))
+        })
+        .collect();
+    for row in s.db.query_json(
+        "SELECT date(received_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM files
+         WHERE feed_id = ?1 AND status <> 'duplicate' AND received_at >= ?2 GROUP BY day",
+        params![id, since],
+    )? {
+        if let Some(entry) = row["day"].as_str().and_then(|d| by_day.get_mut(d)) {
+            entry["files"] = row["n"].clone();
+        }
+    }
+    for row in s.db.query_json(
+        "SELECT date(updated_at / 1000, 'unixepoch') AS day, status, COUNT(*) AS n FROM records
+         WHERE feed_id = ?1 AND status IN ('sent', 'rejected') AND updated_at >= ?2 GROUP BY day, status",
+        params![id, since],
+    )? {
+        if let (Some(entry), Some(status)) = (
+            row["day"].as_str().and_then(|d| by_day.get_mut(d)),
+            row["status"].as_str(),
+        ) {
+            entry[status] = row["n"].clone();
+        }
+    }
+    let rows: Vec<Value> = by_day
+        .into_iter()
+        .map(|(day, v)| json!({"day": day, "files": v["files"], "sent": v["sent"], "rejected": v["rejected"]}))
+        .collect();
+
+    let today_since = today
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let today_json = json!({
+        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = ?1 AND status <> 'duplicate' AND received_at >= ?2", params![id, today_since])?,
+        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = ?1 AND f.received_at >= ?2", params![id, today_since])?,
+        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'sent' AND updated_at >= ?2", params![id, today_since])?,
+        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'rejected' AND updated_at >= ?2", params![id, today_since])?,
+        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status IN ('received', 'pending')", params![id])?,
+    });
+    Ok(Json(
+        json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
+    ))
+}
+
+async fn list_transforms(State(s): State<AppState>) -> ApiResult {
+    Ok(Json(json!({"transforms": s.manager.transforms()?})))
+}
+
+async fn get_transform(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult {
+    let code = s
+        .manager
+        .transform_code(&name)?
+        .ok_or_else(|| not_found(&format!("transform {name}")))?;
+    Ok(Json(json!({"name": name, "code": code})))
+}
+
+#[derive(Deserialize)]
+struct TransformBody {
+    code: String,
+}
+
+async fn put_transform(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<TransformBody>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let existed = s.manager.save_transform(&name, &body.code)?;
+    let status = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(json!({"name": name, "saved": true}))))
+}
+
+#[derive(Deserialize)]
+struct TryBody {
+    records: Vec<Value>,
+}
+
+/// Runs a transform on the supplied records without loading anything.
+async fn try_transform(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<TryBody>,
+) -> ApiResult {
+    if body.records.len() > 100 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "try at most 100 records at a time".into(),
+        ));
+    }
+    let results = s.manager.try_transform(&name, &body.records).await?;
+    Ok(Json(json!({"name": name, "results": results})))
+}
+
+/// What the monitoring page opens on: what needs a person, the last 24 hours, every source.
+async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
+    let mut sources = Vec::new();
+    let mut needs_you = Vec::new();
+    for feed in s.manager.sources() {
+        let status = source_status(&s, &feed)?;
+        let rejected = status["rejected_last_24h"].as_i64().unwrap_or(0);
+        let reason = match status["state"].as_str() {
+            Some("late") => Some(format!(
+                "nothing received since {}, expected at least every {}",
+                status["last_received_at"].as_str().unwrap_or("the start"),
+                status["expect_every"].as_str().unwrap_or("?")
+            )),
+            Some("paused") => Some(format!(
+                "paused{} since {}",
+                status["paused"]["by"]
+                    .as_str()
+                    .map(|b| format!(" by {b}"))
+                    .unwrap_or_default(),
+                status["paused"]["since"].as_str().unwrap_or("?")
+            )),
+            _ if rejected > 0 => Some(format!("{rejected} records rejected in the last 24 hours")),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            needs_you.push(json!({"id": feed.id, "name": feed.name, "state": status["state"], "reason": reason}));
+        }
+        sources.push(status);
+    }
+    let since = now_ms() - DAY_MS;
+    let last_24h = json!({
+        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= ?1", params![since])?,
+        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= ?1", params![since])?,
+        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= ?1", params![since])?,
+        "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= ?1", params![since])?,
+    });
+    Ok(Json(json!({
+        "state": if needs_you.is_empty() { "all_receiving" } else { "needs_you" },
+        "needs_you": needs_you,
+        "last_24h": last_24h,
+        "sources": sources,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -265,7 +467,7 @@ async fn get_record(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult
         )?
         .into_iter()
         .next()
-        .ok_or(ApiError(StatusCode::NOT_FOUND, format!("record {id} not found")))?;
+        .ok_or_else(|| not_found(&format!("record {id}")))?;
     Ok(Json(row))
 }
 
@@ -281,10 +483,7 @@ async fn reprocess(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let raw = body.and_then(|Json(b)| b.raw);
     if !s.db.reprocess(id, raw.as_ref())? {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            format!("record {id} not found"),
-        ));
+        return Err(not_found(&format!("record {id}")));
     }
     Ok((
         StatusCode::ACCEPTED,

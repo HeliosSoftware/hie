@@ -1,0 +1,192 @@
+# On a version tag: build the Linux release binary, publish a GitHub Release and
+# the container image, and deploy to hie.heliossoftware.com. Mirrors the
+# build / docker-build / deploy chain of hfs's ci.yml and deploy-server.yml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: Build Release (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: cargo build --release --locked --bin hie
+      - name: Package
+        # The archive carries everything the server needs next to the binary:
+        # the Python runtime, the example transforms and the example sources.
+        run: |
+          set -eu
+          V="${{ steps.version.outputs.version }}"
+          STAGE="hie-$V-$TARGET"
+          mkdir -p "$STAGE"
+          cp target/release/hie "$STAGE/"
+          cp -r hie_runtime transforms sources examples "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hie-${{ env.TARGET }}
+          path: |
+            hie-*.tar.gz
+            hie-*.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hie-${{ env.TARGET }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hie-*.tar.gz
+            hie-*.tar.gz.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+  docker:
+    name: Build and push container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${V%.*}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "latest=$([[ "$V" == *-* ]] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/heliossoftware/hie:${{ steps.version.outputs.version }}
+            ghcr.io/heliossoftware/hie:${{ steps.version.outputs.major_minor }}
+            ghcr.io/heliossoftware/hie:sha-${{ steps.version.outputs.sha }}
+            ${{ steps.version.outputs.latest == 'true' && 'ghcr.io/heliossoftware/hie:latest' || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy hie
+    runs-on: [self-hosted, Linux, Deploy]
+    needs: [release, docker]
+    steps:
+      - name: Download release archive
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = '${{ github.ref_name }}';
+            const version = tag.startsWith('v') ? tag.substring(1) : tag;
+            const name = `hie-${version}-${process.env.TARGET}.tar.gz`;
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner, repo: context.repo.repo, tag });
+            const asset = release.assets.find(a => a.name === name);
+            if (!asset) throw new Error(`release asset ${name} not found`);
+            const { data } = await github.rest.repos.getReleaseAsset({
+              owner: context.repo.owner, repo: context.repo.repo, asset_id: asset.id,
+              headers: { Accept: 'application/octet-stream' } });
+            fs.writeFileSync('release.tar.gz', Buffer.from(data));
+
+      - name: Deploy binary and create service
+        env:
+          DEPLOY_HOST: ${{ secrets.HIE_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.HIE_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.HIE_DEPLOY_PORT || 22 }}
+          # The HFS this engine delivers to. Public HFS by default.
+          HIE_FHIR_BASE_URL: ${{ secrets.HIE_FHIR_BASE_URL || 'https://hfs.heliossoftware.com' }}
+        run: |
+          set -eu
+          SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
+          SCP="scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $DEPLOY_PORT"
+
+          mkdir -p extracted
+          tar -xzf release.tar.gz -C extracted --strip-components=1
+
+          # The server's configuration: listen on every interface, keep the store
+          # under /opt/hie/data, and point at HFS. The sources and transforms the
+          # archive carries are the examples; what the API creates lands next to them.
+          cat > extracted/hie.yaml <<EOF
+          fhir_base_url: $HIE_FHIR_BASE_URL
+          database: data/hie.db
+          listen: 0.0.0.0:8090
+          sources_dir: sources
+          transforms_dir: transforms
+          python: python3
+          EOF
+
+          $SSH "sudo mkdir -p /opt/hie && sudo systemctl stop hie || true"
+          $SSH "rm -rf /tmp/hie-deploy"
+          $SCP -r extracted "$DEPLOY_USER@$DEPLOY_HOST:/tmp/hie-deploy"
+          # Replace the program and its runtime; keep data/ and anything created
+          # through the API in sources/ and transforms/ between deploys.
+          $SSH "cd /tmp/hie-deploy && \
+                sudo cp hie /opt/hie/hie && sudo chmod +x /opt/hie/hie && \
+                sudo rm -rf /opt/hie/hie_runtime /opt/hie/examples && \
+                sudo cp -r hie_runtime examples /opt/hie/ && \
+                sudo mkdir -p /opt/hie/sources /opt/hie/transforms /opt/hie/data /opt/hie/inbox && \
+                sudo cp -n sources/*.yaml /opt/hie/sources/ 2>/dev/null || true && \
+                sudo cp -n transforms/*.py /opt/hie/transforms/ 2>/dev/null || true && \
+                sudo cp hie.yaml /opt/hie/hie.yaml && \
+                sudo chown -R $DEPLOY_USER:$DEPLOY_USER /opt/hie && \
+                /opt/hie/hie --config /opt/hie/hie.yaml check"
+
+          $SSH "sudo tee /etc/systemd/system/hie.service > /dev/null <<EOF
+          [Unit]
+          Description=Helios Integration Engine
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=$DEPLOY_USER
+          Group=$DEPLOY_USER
+          WorkingDirectory=/opt/hie
+          ExecStart=/opt/hie/hie --config /opt/hie/hie.yaml run
+          Environment=\"HIE_RUNTIME_DIR=/opt/hie/hie_runtime\"
+          Environment=\"HIE_LOG=info\"
+          EnvironmentFile=-/etc/hie/hie.env
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload && sudo systemctl enable hie && sudo systemctl start hie"
+
+          sleep 5
+          if $SSH "sudo systemctl is-active --quiet hie && curl -sf http://127.0.0.1:8090/health"; then
+            echo "hie is running"
+          else
+            $SSH "sudo journalctl -u hie --lines=40"
+            exit 1
+          fi

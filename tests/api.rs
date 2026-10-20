@@ -317,3 +317,185 @@ async fn a_source_lives_through_the_api() {
         .unwrap();
     assert_eq!(records["records"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn transforms_and_monitoring_are_served() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(
+        Router::new()
+            .route("/", post(batch))
+            .with_state(urls.clone()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/lab-results.yaml"),
+        "id: lab-results\nname: Lab results\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 60\n  min_file_age_ms: 0\ntransform: transforms/lab_results.py\nexpect_every: 1s\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+
+    // The transform is listed with the source that uses it, and its code is served.
+    let listed: Value = http
+        .get(format!("{api}/api/transforms"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let t = &listed["transforms"][0];
+    assert_eq!(
+        (t["name"].as_str(), t["path"].as_str()),
+        (Some("lab_results"), Some("transforms/lab_results.py"))
+    );
+    assert_eq!(t["used_by"], json!(["lab-results"]));
+    let code: Value = http
+        .get(format!("{api}/api/transforms/lab_results"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(code["code"].as_str().unwrap().contains("def transform("));
+
+    // Try it: a good row becomes an Observation, a bad one is explained, nothing is loaded.
+    let tried: Value = http
+        .post(format!("{api}/api/transforms/lab_results/try"))
+        .json(&json!({"records": [
+            {"patient": "Patient/1", "code": "GLU", "display": "", "value": "95", "unit": "mg/dL", "date": "2026-10-15"},
+            {"patient": "Patient/1", "code": "2345-7", "display": "Glucose", "value": "alto", "unit": "mg/dL", "date": "2026-10-15"}
+        ]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let results = tried["results"].as_array().unwrap();
+    assert_eq!(
+        results[0]["resources"][0]["code"]["coding"][0]["code"],
+        "2345-7"
+    );
+    assert!(results[0].get("error").is_none());
+    assert_eq!(results[1]["error"]["kind"], "data");
+    assert!(
+        results[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a number")
+    );
+    assert!(urls.lock().unwrap().is_empty());
+
+    // A new transform is created through the API and shows up as unused.
+    let created = http
+        .put(format!("{api}/api/transforms/passthrough-copy"))
+        .json(&json!({"code": "def transform(record, context):\n    return record\n"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let listed: Value = http
+        .get(format!("{api}/api/transforms"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["transforms"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        http.put(format!("{api}/api/transforms/bad name"))
+            .json(&json!({"code": ""}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+
+    // Monitoring: nothing yet, then a silent source needs someone.
+    let status: Value = http
+        .get(format!("{api}/api/monitoring/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["state"], "all_receiving");
+    assert_eq!(status["last_24h"]["files"], 0);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    http.post(format!("{api}/api/sources/lab-results/check-now"))
+        .send()
+        .await
+        .unwrap();
+    let (api2, http2) = (api.clone(), http.clone());
+    wait_until(
+        move || {
+            let (api, http) = (api2.clone(), http2.clone());
+            Box::pin(async move {
+                let s: Value = http
+                    .get(format!("{api}/api/monitoring/status"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                s["state"] == "needs_you"
+            })
+        },
+        "the silent source",
+    )
+    .await;
+    let status: Value = http
+        .get(format!("{api}/api/monitoring/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["needs_you"][0]["id"], "lab-results");
+    assert!(
+        status["needs_you"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("nothing received")
+    );
+    assert_eq!(status["last_24h"]["alerts"], 1);
+
+    // Stats: the shape a source's page draws, with today last.
+    let stats: Value = http
+        .get(format!("{api}/api/sources/lab-results/stats?days=3"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
+    assert_eq!(stats["today"]["files"], 0);
+}
