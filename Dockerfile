@@ -18,6 +18,9 @@ COPY hie_runtime/ /hie/hie_runtime/
 COPY transforms/ /hie/transforms/
 COPY sources/ /hie/sources/
 COPY hie.yaml /hie/hie.yaml
+# Listen on every interface so a published port (-p 8090:8090) reaches the API.
+RUN sed -i 's/^listen: .*/listen: 0.0.0.0:8090/' /hie/hie.yaml \
+    && grep -qx 'listen: 0.0.0.0:8090' /hie/hie.yaml
 ENV HIE_CONFIG=/hie/hie.yaml \
     HIE_RUNTIME_DIR=/hie/hie_runtime \
     HIE_LOG=info

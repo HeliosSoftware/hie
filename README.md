@@ -45,12 +45,49 @@ cp examples/data/labs.csv inbox/lab-results/
 curl localhost:8090/api/sources
 ```
 
-On Linux, in a container:
+### In Docker
+
+Each release publishes a public Linux x86_64 image to `ghcr.io/heliossoftware/hie` (tags `:{version}`, `:{major.minor}`, `:latest`; see [Release and deploy](#release-and-deploy)). The image holds the engine, Python 3, `hie_runtime/`, and the example `transforms/` and `sources/` under `/hie`.
+
+The `hie.yaml` baked into the image listens on `0.0.0.0:8090`, so `docker run -p 8090:8090 ghcr.io/heliossoftware/hie:latest` serves the API, but it expects HFS at `localhost:8080`, which inside a container is the container itself. To deliver anywhere, mount your own config. To run HIE and HFS side by side on one Docker network:
 
 ```sh
-docker build -t hie .
-docker run --rm -p 8090:8090 -v $PWD/inbox:/hie/inbox hie
+mkdir -p inbox/lab-results data
+cat > hie.docker.yaml <<'EOF'
+fhir_base_url: http://hfs:8080   # HFS as this container sees it
+public_url: http://hie:8090      # HIE as HFS sees it (for $bulk-submit)
+database: data/hie.db
+listen: 0.0.0.0:8090             # all interfaces, so -p can reach it
+sources_dir: sources
+transforms_dir: transforms
+EOF
+
+docker network create hie-net
+docker run -d --name hfs --network hie-net -p 8080:8080 ghcr.io/heliossoftware/hfs:latest
+docker run -d --name hie --network hie-net -p 8090:8090 \
+  -v $PWD/hie.docker.yaml:/hie/hie.yaml:ro \
+  -v $PWD/inbox:/hie/inbox \
+  -v $PWD/data:/hie/data \
+  ghcr.io/heliossoftware/hie:latest
+
+curl localhost:8090/health                        # {"status":"ok"}
+cp examples/data/labs.csv inbox/lab-results/      # picked up within 5 s
+curl localhost:8090/api/sources/lab-results       # records.sent: 3
+curl 'localhost:8080/Observation?_summary=count'  # total: 3
 ```
+
+If HFS runs on the host instead, drop `--network`, use `fhir_base_url: http://host.docker.internal:8080`, and add `--add-host=host.docker.internal:host-gateway` on Linux.
+
+| Mount | Holds |
+|---|---|
+| `/hie/hie.yaml` | the engine configuration (required, see above) |
+| `/hie/inbox` | the folders the example folder sources watch; processed files move to `processed/` |
+| `/hie/data` | the SQLite store: records, delivery state, alerts. Without it, history is lost with the container |
+| `/hie/sources`, `/hie/transforms` | optional: your own sources and transforms, and anything created through the API, kept across upgrades |
+
+Other commands: `docker run --rm ghcr.io/heliossoftware/hie:latest --version`, and `... check` with the same mounts to validate the config and sources. The container runs as root, so files it writes to the mounts are owned by root. Pass the `HIE_AUTH_*` variables (see [Authentication](#authentication)) and AWS credentials with `-e`.
+
+To build the image yourself: `docker build -t hie .`
 
 | Variable | Default | Purpose |
 |---|---|---|
