@@ -126,11 +126,11 @@ jobs:
           # The HFS this engine delivers to. Public HFS by default.
           HIE_FHIR_BASE_URL: ${{ secrets.HIE_FHIR_BASE_URL || 'https://hfs.heliossoftware.com' }}
           # Bearer-token validation for the API: the identity provider's JWKS and
-          # issuer. Without them the deploy stops, unless HIE_API_OPEN is "true".
+          # issuer. Unset on the public sandbox, which is open like the public HFS;
+          # set in a secure environment.
           HIE_AUTH_JWKS_URL: ${{ secrets.HIE_AUTH_JWKS_URL }}
           HIE_AUTH_ISSUER: ${{ secrets.HIE_AUTH_ISSUER }}
           HIE_AUTH_AUDIENCE: ${{ secrets.HIE_AUTH_AUDIENCE }}
-          HIE_API_OPEN: ${{ secrets.HIE_API_OPEN }}
         run: |
           set -eu
           SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -173,12 +173,9 @@ jobs:
             printf 'HIE_AUTH_ENABLED=true\nHIE_AUTH_JWKS_URL=%s\nHIE_AUTH_ISSUER=%s\nHIE_AUTH_AUDIENCE=%s\n' \
               "$HIE_AUTH_JWKS_URL" "$HIE_AUTH_ISSUER" "$HIE_AUTH_AUDIENCE" | \
               $SSH "sudo sh -c 'umask 077; mkdir -p /etc/hie; cat > /etc/hie/hie.env'"
-          elif [ "$HIE_API_OPEN" = "true" ]; then
-            echo "HIE_API_OPEN=true: deploying with the API open; anyone who can reach it can change sources and transforms"
-            $SSH "sudo sh -c 'mkdir -p /etc/hie; : > /etc/hie/hie.env'"
           else
-            echo "HIE_AUTH_JWKS_URL and HIE_AUTH_ISSUER are not set. Set them, or HIE_API_OPEN=true to deploy with the API open."
-            exit 1
+            echo "HIE_AUTH_JWKS_URL and HIE_AUTH_ISSUER are not set: deploying with the API open (the public sandbox)"
+            $SSH "sudo sh -c 'mkdir -p /etc/hie; : > /etc/hie/hie.env'"
           fi
 
           $SSH "sudo tee /etc/systemd/system/hie.service > /dev/null <<EOF

@@ -225,7 +225,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 20. Bearer tokens on the API, validated as HFS validates them
 
-**Chosen:** With `HIE_AUTH_ENABLED=true`, everything under `/api` requires a JWT validated against the identity provider's JWKS with the expected issuer and audience, through HFS's `helios-auth` crate; `/health` and `/metrics` stay open. The deploy refuses to run without the auth secrets unless an open API is requested explicitly.
+**Chosen:** With `HIE_AUTH_ENABLED=true`, everything under `/api` requires a JWT validated against the identity provider's JWKS with the expected issuer and audience, through HFS's `helios-auth` crate; `/health` and `/metrics` stay open. Keycloak first, and the same providers HFS supports after it. The public sandbox follows the public HFS: open, for showing the work and for demos, with nothing sensitive on it; a secure environment sets the `HIE_AUTH_*` secrets and the deploy turns validation on.
 
 **Why:**
 - Saving a transform is running code on the engine; an open API on a public host is remote code execution for anyone who finds it.
