@@ -1,8 +1,9 @@
-//! Helios Integration Engine: gets data from source feeds into HFS,
+//! Helios Integration Engine: gets data from sources into HFS,
 //! with per-record traceability, idempotent delivery, retries and alerts.
 
 pub mod alerts;
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod fhir;
@@ -23,6 +24,7 @@ pub fn build(
     config: &config::Config,
     feeds: Vec<config::FeedConfig>,
     runtime_dir: &Path,
+    auth: auth::Auth,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::open(&config.database)?);
     let fhir = Arc::new(fhir::FhirClient::new(&config.fhir_base_url));
@@ -32,5 +34,5 @@ pub fn build(
     ));
     let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts);
     manager.start_all(feeds)?;
-    Ok((manager.clone(), api::AppState { db, manager }))
+    Ok((manager.clone(), api::AppState { db, manager, auth }))
 }

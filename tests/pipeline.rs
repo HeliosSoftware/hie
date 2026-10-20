@@ -131,7 +131,7 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
+    let (manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
     let runner: Arc<FeedRunner> = manager.runner("lab-results").unwrap();
     manager.pause("lab-results", None).unwrap(); // the test drives the passes itself
     let inbox = root.join("inbox");

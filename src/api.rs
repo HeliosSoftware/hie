@@ -18,11 +18,13 @@ use crate::pipeline::human;
 pub struct AppState {
     pub db: Arc<Db>,
     pub manager: Arc<SourceManager>,
+    pub auth: crate::auth::Auth,
 }
 
+/// Everything under `/api` needs a bearer token when auth is on; `/health` and
+/// `/metrics` stay open for probes and the metrics scraper.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+    let api = Router::new()
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/test", post(test_source))
         .route(
@@ -45,7 +47,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/records/{id}", get(get_record))
         .route("/api/records/{id}/reprocess", post(reprocess))
         .route("/api/alerts", get(list_alerts))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.auth.clone(),
+            crate::auth::require_bearer,
+        ));
+    Router::new()
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/metrics", get(metrics))
+        .merge(api)
         .with_state(state)
 }
 
@@ -202,9 +211,13 @@ struct PauseBody {
 async fn pause_source(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    principal: Option<axum::Extension<Arc<helios_auth::Principal>>>,
     body: Option<Json<PauseBody>>,
 ) -> ApiResult {
-    let by = body.and_then(|Json(b)| b.by);
+    // Who paused it: the body's name, else the authenticated subject.
+    let by = body
+        .and_then(|Json(b)| b.by)
+        .or_else(|| principal.map(|axum::Extension(p)| p.subject().to_string()));
     s.manager.pause(&id, by.as_deref())?;
     get_source(State(s), Path(id)).await
 }

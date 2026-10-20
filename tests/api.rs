@@ -91,7 +91,7 @@ async fn a_source_lives_through_the_api() {
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
     assert!(feeds.is_empty());
-    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
+    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
 
@@ -351,7 +351,7 @@ async fn transforms_and_monitoring_are_served() {
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
+    let (_manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime"), None).unwrap();
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
 

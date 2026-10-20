@@ -221,7 +221,18 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Why:** The client UI's Transforms and Monitoring modules need these to render anything, and the assessment in discussion #1 lists them as the next additions after sources. "Try it" reuses the same Python worker as a real load, so the test is the real thing.
 
-**Not yet:** transform versions and "used by since"; failures grouped by reason with the transform line; alert rules with recipients; authentication, without which saving a transform is remote code execution and the API must stay on a trusted network.
+**Not yet:** transform versions and "used by since"; failures grouped by reason with the transform line; alert rules with recipients.
+
+## 20. Bearer tokens on the API, validated as HFS validates them
+
+**Chosen:** With `HIE_AUTH_ENABLED=true`, everything under `/api` requires a JWT validated against the identity provider's JWKS with the expected issuer and audience, through HFS's `helios-auth` crate; `/health` and `/metrics` stay open. The deploy refuses to run without the auth secrets unless an open API is requested explicitly.
+
+**Why:**
+- Saving a transform is running code on the engine; an open API on a public host is remote code execution for anyone who finds it.
+- The same crate and the same claims as HFS mean one identity provider, one token, and the same `HFS_AUTH_*`-shaped settings an operator already knows.
+- The subject of the token is what the UI's "paused by" needs, so it is recorded.
+
+**Not yet:** scopes and roles (any valid token from the issuer may do everything); the engine's own credentials for calling HFS (client credentials); per-user audit of changes.
 
 ## Not in the prototype
 

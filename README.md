@@ -131,7 +131,20 @@ def transform(record, context):
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok"}` |
 
-The API has no authentication yet. `PUT /api/transforms/{name}` writes code the engine then runs, so until bearer-token validation lands the API must only be reachable from trusted clients.
+## Authentication
+
+With `HIE_AUTH_ENABLED=true`, every request under `/api` needs a bearer token signed by the identity provider: a JWT validated against `HIE_AUTH_JWKS_URL` with the expected `HIE_AUTH_ISSUER` and, when set, `HIE_AUTH_AUDIENCE`. This is the same validation HFS performs, through its `helios-auth` crate. `/health` and `/metrics` stay open. A missing or invalid token answers `401` with `WWW-Authenticate: Bearer`. A pause without a `by` in the body records the token's subject.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HIE_AUTH_ENABLED` | `false` | Require bearer tokens under `/api` |
+| `HIE_AUTH_JWKS_URL` | | The identity provider's JWKS |
+| `HIE_AUTH_ISSUER` | | Expected `iss`; required when enabled |
+| `HIE_AUTH_AUDIENCE` | | Expected `aud`, when the provider sets one |
+| `HIE_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Accepted signing algorithms |
+| `HIE_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Seconds between JWKS refreshes |
+
+With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` writes code the engine then runs, so an open API must only be reachable from trusted clients. Scopes are not enforced yet: any valid token from the issuer may do everything.
 
 ## Release and deploy
 
@@ -142,7 +155,7 @@ A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the H
 3. **Image**: `ghcr.io/heliossoftware/hie:{version}`, `:{major.minor}`, `:sha-{sha}`, and `:latest` for a non-prerelease.
 4. **Deploy**: from the `Deploy` runner over SSH to the host behind `hie.heliossoftware.com`: the binary and runtime go to `/opt/hie`, a systemd unit `hie` runs it on `0.0.0.0:8090`, and the job fails unless `/health` answers. `data/` and anything created through the API in `sources/` and `transforms/` survive a deploy.
 
-Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional), and `HIE_FHIR_BASE_URL` (defaults to the public HFS). Extra environment for the service can be put in `/etc/hie/hie.env` on the host.
+Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional), `HIE_FHIR_BASE_URL` (defaults to the public HFS), and for the API's authentication `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER` and `HIE_AUTH_AUDIENCE`, written to the root-only `/etc/hie/hie.env` on the host. Without the auth secrets the deploy stops; `HIE_API_OPEN=true` deploys with the API open on purpose.
 
 ## Layout
 

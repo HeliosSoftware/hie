@@ -21,6 +21,7 @@ chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 csv = "1.3.1"
 futures = "0.3"
+helios-auth = "0.2"
 hex = "0.4.3"
 object_store = { version = "0.11", features = ["aws"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
@@ -34,4 +35,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+jsonwebtoken = "9"
 tempfile = "3"

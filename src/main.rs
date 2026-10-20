@@ -62,7 +62,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (_manager, state) = hie::build(&config, feeds, &runtime_dir)?;
+    let auth = hie::auth::build(&hie::auth::AuthSettings::from_env()).await?;
+    match &auth {
+        Some(_) => tracing::info!("API authentication on: bearer tokens required under /api"),
+        None => tracing::warn!(
+            "API authentication is off (HIE_AUTH_ENABLED is not true): anyone who can reach the API can change sources and transforms"
+        ),
+    }
+    let (_manager, state) = hie::build(&config, feeds, &runtime_dir, auth)?;
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
