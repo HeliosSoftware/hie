@@ -35,5 +35,13 @@ pub fn build(
     ));
     let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts);
     manager.start_all(feeds)?;
-    Ok((manager.clone(), api::AppState { db, manager, auth }))
+    Ok((
+        manager.clone(),
+        api::AppState {
+            db,
+            manager,
+            auth,
+            started: api::Started::now(),
+        },
+    ))
 }

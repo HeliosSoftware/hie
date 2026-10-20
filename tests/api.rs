@@ -95,6 +95,20 @@ async fn a_source_lives_through_the_api() {
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
 
+    let health: Value = http
+        .get(format!("{api}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["service"], "hie");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert!(health["uptime_seconds"].as_f64().unwrap() >= 0.0);
+    assert!(health["started_at"].is_string() && health["timestamp"].is_string());
+
     // Nothing yet.
     let listed: Value = http
         .get(format!("{api}/api/sources"))

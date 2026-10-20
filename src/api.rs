@@ -19,6 +19,23 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub manager: Arc<SourceManager>,
     pub auth: crate::auth::Auth,
+    pub started: Started,
+}
+
+/// When the process came up, for the uptime that `/health` reports.
+#[derive(Clone, Copy)]
+pub struct Started {
+    at: chrono::DateTime<chrono::Utc>,
+    instant: std::time::Instant,
+}
+
+impl Started {
+    pub fn now() -> Self {
+        Started {
+            at: chrono::Utc::now(),
+            instant: std::time::Instant::now(),
+        }
+    }
 }
 
 /// Everything under `/api` needs a bearer token when auth is on; `/health` and
@@ -60,7 +77,7 @@ pub fn router(state: AppState) -> Router {
             crate::auth::require_bearer,
         ));
     Router::new()
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/health", get(health))
         .route("/metrics", get(metrics))
         // What HFS fetches during a $bulk-submit: the manifest, and the objects of
         // sources that cannot sign URLs. The token in the path is unguessable.
@@ -68,6 +85,17 @@ pub fn router(state: AppState) -> Router {
         .route("/bulk/{token}/files/{file_id}", get(bulk_file))
         .merge(api)
         .with_state(state)
+}
+
+async fn health(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "hie",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": s.started.instant.elapsed().as_secs_f64(),
+        "started_at": s.started.at.to_rfc3339(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
 }
 
 async fn bulk_manifest(State(s): State<AppState>, Path(token): Path<String>) -> ApiResult {

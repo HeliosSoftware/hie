@@ -70,7 +70,7 @@ docker run -d --name hie --network hie-net -p 8090:8090 \
   -v $PWD/data:/hie/data \
   ghcr.io/heliossoftware/hie:latest
 
-curl localhost:8090/health                        # {"status":"ok"}
+curl localhost:8090/health                        # {"status":"ok","service":"hie","version":...}
 cp examples/data/labs.csv inbox/lab-results/      # picked up within 5 s
 curl localhost:8090/api/sources/lab-results       # records.sent: 3
 curl 'localhost:8080/Observation?_summary=count'  # total: 3
@@ -192,7 +192,7 @@ def transform(record, context):
 | `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
-| `GET /health` | `{"status": "ok"}` |
+| `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp"}` |
 
 ## Authentication
 
