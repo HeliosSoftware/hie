@@ -174,7 +174,7 @@ With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` w
 
 ## Release and deploy
 
-A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the HFS release chain:
+A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the HFS release chain (see [RELEASING.md](RELEASING.md) for how to cut one):
 
 1. **Build**: the Linux x86_64 release binary, packaged with `hie_runtime/`, `transforms/`, `sources/` and `examples/` as `hie-{version}-x86_64-unknown-linux-gnu.tar.gz`.
 2. **Release**: a GitHub Release with the archive and its SHA-256.
