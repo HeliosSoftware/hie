@@ -1,0 +1,240 @@
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+
+use crate::fhir::DeliveryKey;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+
+/// What a transform made of one record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    Resources(Vec<Value>),
+    Rejected { kind: String, message: String },
+}
+
+/// A long-lived Python process running one feed's transform script.
+pub struct Transformer {
+    python: String,
+    worker_script: PathBuf,
+    transform_script: PathBuf,
+    worker: Mutex<Option<Worker>>,
+}
+
+struct Worker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl Transformer {
+    pub fn new(python: &str, runtime_dir: &Path, transform_script: &Path) -> Self {
+        Self {
+            python: python.to_string(),
+            worker_script: runtime_dir.join("worker.py"),
+            transform_script: transform_script.to_path_buf(),
+            worker: Mutex::new(None),
+        }
+    }
+
+    async fn spawn(&self) -> Result<Worker> {
+        let mut child = Command::new(&self.python)
+            .arg("-u")
+            .arg(&self.worker_script)
+            .arg(&self.transform_script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!("starting {} {}", self.python, self.worker_script.display())
+            })?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?);
+        let mut line = String::new();
+        stdout.read_line(&mut line).await?;
+        if serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|v| v.get("ready").cloned())
+            != Some(json!(true))
+        {
+            bail!(
+                "transform {} failed to load",
+                self.transform_script.display()
+            );
+        }
+        Ok(Worker {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        })
+    }
+
+    async fn call(worker: &mut Worker, record: &Value, context: &Value) -> Result<Value> {
+        let id = worker.next_id;
+        worker.next_id += 1;
+        let mut request = json!({"id": id, "record": record, "context": context}).to_string();
+        request.push('\n');
+        worker.stdin.write_all(request.as_bytes()).await?;
+        worker.stdin.flush().await?;
+        let mut line = String::new();
+        if worker.stdout.read_line(&mut line).await? == 0 {
+            bail!("transform process exited");
+        }
+        let reply: Value =
+            serde_json::from_str(&line).context("invalid reply from transform process")?;
+        if reply.get("id") != Some(&json!(id)) {
+            bail!("transform reply out of order");
+        }
+        Ok(reply)
+    }
+
+    /// Transforms one record. An error here means the transform process itself failed,
+    /// not the data: the record stays queued and is tried again.
+    pub async fn transform(&self, record: &Value, context: &Value) -> Result<Outcome> {
+        let mut guard = self.worker.lock().await;
+        for attempt in 0..2 {
+            if guard.is_none() {
+                *guard = Some(self.spawn().await?);
+            }
+            let worker = guard.as_mut().expect("worker present");
+            match Self::call(worker, record, context).await {
+                Ok(reply) => return Ok(parse_reply(&reply)),
+                Err(e) => {
+                    if let Some(mut w) = guard.take() {
+                        let _ = w.child.kill().await;
+                    }
+                    if attempt == 1 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn parse_reply(reply: &Value) -> Outcome {
+    if let Some(err) = reply.get("error") {
+        let kind = err
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("transform")
+            .to_string();
+        let mut message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("transform failed")
+            .to_string();
+        if let Some(trace) = err.get("trace").and_then(Value::as_str) {
+            message = format!("{message}\n{trace}");
+        }
+        return Outcome::Rejected { kind, message };
+    }
+    let resources = reply
+        .get("resources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Outcome::Resources(resources)
+}
+
+/// Checks what HIE itself relies on: a resource type, and a key that makes delivery
+/// idempotent. A resource with an `id` is written to `{type}/{id}`; one without needs
+/// a business identifier and is written as a conditional update on it.
+pub fn check_resource(resource: &Value) -> std::result::Result<DeliveryKey, String> {
+    let rt = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("resource has no resourceType")?;
+    if let Some(id) = resource
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(DeliveryKey::Id {
+            resource_type: rt.to_string(),
+            id: id.to_string(),
+        });
+    }
+    let ident = resource
+        .get("identifier")
+        .and_then(Value::as_array)
+        .and_then(|ids| ids.first())
+        .ok_or_else(|| {
+            format!(
+                "{rt} has neither id nor identifier; HIE needs one to avoid duplicates on re-send"
+            )
+        })?;
+    let system = ident
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let value = ident
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (system, value) {
+        (Some(s), Some(v)) => Ok(DeliveryKey::Identifier {
+            resource_type: rt.to_string(),
+            system: s.to_string(),
+            value: v.to_string(),
+        }),
+        _ => Err(format!("{rt}.identifier[0] needs both system and value")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replies_map_to_outcomes() {
+        assert_eq!(
+            parse_reply(&json!({"id": 1, "resources": [{"resourceType": "Observation"}]})),
+            Outcome::Resources(vec![json!({"resourceType": "Observation"})])
+        );
+        assert_eq!(
+            parse_reply(&json!({"id": 1, "error": {"kind": "data", "message": "bad value"}})),
+            Outcome::Rejected {
+                kind: "data".into(),
+                message: "bad value".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resources_need_an_id_or_an_identifier() {
+        let by_identifier = json!({"resourceType": "Observation", "identifier": [{"system": "urn:x", "value": "1"}]});
+        assert_eq!(
+            check_resource(&by_identifier).unwrap(),
+            DeliveryKey::Identifier {
+                resource_type: "Observation".into(),
+                system: "urn:x".into(),
+                value: "1".into()
+            }
+        );
+        let by_id =
+            json!({"resourceType": "Patient", "id": "p1", "identifier": [{"value": "mrn"}]});
+        assert_eq!(
+            check_resource(&by_id).unwrap(),
+            DeliveryKey::Id {
+                resource_type: "Patient".into(),
+                id: "p1".into()
+            }
+        );
+        assert!(
+            check_resource(&json!({"resourceType": "Observation"}))
+                .unwrap_err()
+                .contains("neither id nor identifier")
+        );
+        assert!(check_resource(&json!({"identifier": []})).is_err());
+    }
+}

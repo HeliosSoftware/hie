@@ -12,20 +12,21 @@ Each decision states what was chosen, the evidence behind it, and what it costs.
 
 **Cost:** HIE cannot use HFS shortcuts (for example a direct database load). For very large feeds, `$bulk-submit` is the path (see 7).
 
-## 2. .NET for the engine
+## 2. Rust for the engine
 
-**Chosen:** The engine (polling, storage, delivery, API, alerts) is a .NET 10 service, built and run on Linux (see the `Dockerfile`). It replaces the Rust prototype, which stays in the history as the behavioural reference: its tests were ported one for one.
+**Chosen:** The engine (polling, storage, delivery, API, alerts) is a single Rust binary, built and run on Linux (see the `Dockerfile` and the CI workflow).
 
 **Why:**
-- The team that will own the engine is faster in .NET, and the service has to ship within weeks. [Discussion #2](https://github.com/HeliosSoftware/hie/discussions/2) has the comparison.
-- The engine is I/O bound (reading objects, calling HFS, waiting on the transform runtime); the two stacks do not differ in throughput enough to outweigh who maintains it.
-- Aspire is adopted for running the surrounding services together in development; the engine emits OpenTelemetry signals so the same dashboard covers it and HFS.
-- The condition attached to the decision is that it runs on Linux, which the container image satisfies.
+- HIE is a separate product from the applications built on HFS: the integration work is messy and error-prone, and it is kept in its own service that those applications call through an API. Because it is independent, it does not inherit the stack of any one client application. [Discussion #2](https://github.com/HeliosSoftware/hie/discussions/2) has the comparison with .NET and the record of the decision, which was taken for .NET on 2026-10-19 and returned to Rust on 2026-10-20 on that reasoning.
+- It is the same toolchain, CI and dependency set as HFS and HTS: the crate uses the versions already in the HFS lockfile, and it can later reuse `helios-fhir` types and the shared auth and observability crates.
+- One static binary, a small memory footprint, no runtime to install.
+- Both engines tried are Java. OIE needed a server, an embedded database and a desktop client, and the client failed three ways on Windows before it worked: launcher JVM options, missing JavaFX, classpath order.
 
 **Cost:**
-- Nothing is shared at the code level with HFS and HTS (their FHIR models, auth and observability crates); the engine talks to HFS only over the FHIR API, which decision 1 already required.
-- A larger runtime and memory footprint than the Rust binary.
-- Transform authors still should not need the engine's language (see 3).
+- Transform authors should not need Rust (see 3).
+- The client application's services run under Aspire; the engine joins that as a container, and emits OpenTelemetry so the same dashboard covers it (to be wired, as in HFS's `helios-observability`).
+
+A complete .NET 10 port of the engine exists in the history (commit `c3272d4`), test for test, and was green on Linux; it is the fallback if the decision changes again.
 
 ## 3. Transforms in Python, in a separate process
 

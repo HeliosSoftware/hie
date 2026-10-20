@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "dgSpecHash": "sVbmvNyscBY=",
+  "success": true,
+  "projectFilePath": "C:\\dev\\helios-hie\\src\\Hie\\Hie.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\rocks\\.nuget\\packages\\awssdk.core\\4.0.102.11\\awssdk.core.4.0.102.11.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\awssdk.s3\\4.0.104.4\\awssdk.s3.4.0.104.4.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\microsoft.data.sqlite\\10.0.13\\microsoft.data.sqlite.10.0.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\microsoft.data.sqlite.core\\10.0.13\\microsoft.data.sqlite.core.10.0.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry\\1.20.0\\opentelemetry.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.api\\1.20.0\\opentelemetry.api.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.api.providerbuilderextensions\\1.20.0\\opentelemetry.api.providerbuilderextensions.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.exporter.opentelemetryprotocol\\1.20.0\\opentelemetry.exporter.opentelemetryprotocol.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.extensions.hosting\\1.20.0\\opentelemetry.extensions.hosting.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.instrumentation.aspnetcore\\1.20.0\\opentelemetry.instrumentation.aspnetcore.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.instrumentation.http\\1.20.0\\opentelemetry.instrumentation.http.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\opentelemetry.instrumentation.runtime\\1.20.0\\opentelemetry.instrumentation.runtime.1.20.0.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\sqlitepclraw.bundle_e_sqlite3\\2.1.13\\sqlitepclraw.bundle_e_sqlite3.2.1.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\sqlitepclraw.core\\2.1.13\\sqlitepclraw.core.2.1.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\sqlitepclraw.lib.e_sqlite3\\2.1.13\\sqlitepclraw.lib.e_sqlite3.2.1.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\sqlitepclraw.provider.e_sqlite3\\2.1.13\\sqlitepclraw.provider.e_sqlite3.2.1.13.nupkg.sha512",
+    "C:\\Users\\rocks\\.nuget\\packages\\yamldotnet\\18.1.0\\yamldotnet.18.1.0.nupkg.sha512"
+  ],
+  "logs": []
+}
