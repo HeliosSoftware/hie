@@ -204,6 +204,17 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Not yet verified:** The source has not been run against a real bucket; the object-store path is covered by the in-memory tests. That is the first thing to do once a bucket exists.
 
+## 18. Sources are API resources, persisted as the same files
+
+**Chosen:** `POST /api/sources` creates a source from its definition (the YAML document as JSON), the engine writes `sources/{id}.yaml` and starts the source without a restart; `PUT` replaces and restarts it; `DELETE` stops it and removes the file. Pause and resume are operational state kept in the database with who and when, not in the definition. `check-now` makes a source pass at once. `POST /api/sources/test` lists a connection once and returns the evidence (reachable, elapsed, objects, newest).
+
+**Why:**
+- The client UI's design configures a source in the application, in five steps, with a connection test whose result stays on the page, and pauses, resumes and re-checks a source from its page. All of that needs the engine to own the definition.
+- Decision 4 still holds: the engine writes the same files it reads, so definitions stay under version control, diffable, and usable without the API.
+- Pause is not part of the definition because it is a fact about operations ("paused by X since Y"), it must survive a restart, and it must not appear as a change to the source's file.
+
+**Cost:** Two sources of truth for a definition while a process runs (the file and memory); the engine resolves it by re-reading the file when it reports a definition, and by rewriting the file before restarting a source. Concurrent edits of the same file by a person and the API are not arbitrated.
+
 ## Not in the prototype
 
 - Connectors besides a folder and S3: database, another FHIR server.

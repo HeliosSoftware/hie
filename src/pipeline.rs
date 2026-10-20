@@ -16,6 +16,13 @@ use crate::transform::{self, Outcome, Transformer};
 
 const TRANSFORM_CHUNK: usize = 200;
 
+/// How the manager drives a running feed: `poke` makes it pass now, `stopped` ends it.
+#[derive(Default)]
+pub struct RunnerControl {
+    pub poke: tokio::sync::Notify,
+    pub stopped: AtomicBool,
+}
+
 /// Moves one feed's data through: source -> stored rows -> transform -> HFS.
 /// Every row is in the database before its object leaves the source, so a crash or an
 /// HFS outage never loses data, and every row keeps its object name and line number.
@@ -75,13 +82,28 @@ impl FeedRunner {
         }
     }
 
-    pub async fn run(self: Arc<Self>) {
+    /// The feed's loop: a pass every poll interval, or sooner when poked; nothing
+    /// while the source is paused; until stopped.
+    pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {
         tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), "watching");
         loop {
-            if let Err(e) = self.tick().await {
-                tracing::error!(feed = %self.feed.id, "{e:#}");
+            if control.stopped.load(Ordering::Acquire) {
+                tracing::info!(feed = %self.feed.id, "stopped");
+                return;
             }
-            tokio::time::sleep(self.feed.source.poll_interval()).await;
+            match self.db.is_paused(&self.feed.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(e) = self.tick().await {
+                        tracing::error!(feed = %self.feed.id, "{e:#}");
+                    }
+                }
+                Err(e) => tracing::error!(feed = %self.feed.id, "{e:#}"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(self.feed.source.poll_interval()) => {}
+                _ = control.poke.notified() => {}
+            }
         }
     }
 

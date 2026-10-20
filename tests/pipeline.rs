@@ -112,7 +112,7 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     let (base, fhir) = fhir_server().await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::create_dir_all(root.join("feeds")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
     std::fs::create_dir_all(root.join("transforms")).unwrap();
     std::fs::copy(
         repo().join("transforms/lab_results.py"),
@@ -125,14 +125,15 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     )
     .unwrap();
     std::fs::write(
-        root.join("feeds/lab-results.yaml"),
+        root.join("sources/lab-results.yaml"),
         "id: lab-results\nname: Lab results\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
          transform: transforms/lab_results.py\ndelivery:\n  initial_backoff_ms: 10\n  alert_after_attempts: 2\nexpect_every: 1s\n",
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (runners, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
-    let runner: Arc<FeedRunner> = runners[0].clone();
+    let (manager, state) = hie::build(&config, feeds, &repo().join("hie_runtime")).unwrap();
+    let runner: Arc<FeedRunner> = manager.runner("lab-results").unwrap();
+    manager.pause("lab-results", None).unwrap(); // the test drives the passes itself
     let inbox = root.join("inbox");
     let labs = std::fs::read_to_string(repo().join("examples/data/labs.csv")).unwrap();
 

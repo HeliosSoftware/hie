@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
+use serde::Serialize;
 
 use crate::config::{FeedConfig, SourceConfig, glob_match};
 
@@ -240,6 +241,82 @@ impl ObjectSource {
             .await
             .with_context(|| format!("archiving {key}"))?;
         Ok(())
+    }
+}
+
+/// What a connection test found: the evidence the UI keeps on the page.
+#[derive(Debug, Clone, Serialize)]
+pub struct Probe {
+    pub reachable: bool,
+    pub elapsed_ms: u64,
+    /// Objects matching the pattern, whatever their age.
+    pub objects: usize,
+    pub newest: Option<String>,
+    pub newest_at: Option<String>,
+}
+
+impl Source {
+    /// Lists the source once and reports what is there, without taking anything.
+    pub async fn probe(&self) -> Result<Probe> {
+        let started = Instant::now();
+        let found = match self {
+            Source::Folder(f) => f.probe()?,
+            Source::Object(o) => o.probe().await?,
+        };
+        let newest = found.iter().max_by_key(|(_, at)| *at);
+        Ok(Probe {
+            reachable: true,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            objects: found.len(),
+            newest: newest.map(|(k, _)| k.clone()),
+            newest_at: newest.map(|(_, at)| at.to_rfc3339()),
+        })
+    }
+}
+
+impl FolderSource {
+    fn probe(&self) -> Result<Vec<(String, DateTime<Utc>)>> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)
+            .with_context(|| format!("reading {}", self.dir.display()))?
+        {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !path.is_file() || !glob_match(&self.pattern, name) {
+                continue;
+            }
+            let modified = std::fs::metadata(&path)?
+                .modified()
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_default();
+            found.push((name.to_string(), modified));
+        }
+        Ok(found)
+    }
+}
+
+impl ObjectSource {
+    async fn probe(&self) -> Result<Vec<(String, DateTime<Utc>)>> {
+        let archive_prefix = format!("{}/", self.archive);
+        let mut stream = self.store.list(self.prefix.as_ref());
+        let mut found = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.context("listing objects")?;
+            let key = meta.location.to_string();
+            if key.starts_with(&archive_prefix) {
+                continue;
+            }
+            let Some(name) = meta.location.filename() else {
+                continue;
+            };
+            if !glob_match(&self.pattern, name) {
+                continue;
+            }
+            found.push((key, meta.last_modified));
+        }
+        Ok(found)
     }
 }
 

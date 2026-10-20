@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS alerts (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS alerts_feed_kind ON alerts(feed_id, kind, created_at);
+CREATE TABLE IF NOT EXISTS source_state (
+  feed_id TEXT PRIMARY KEY,
+  paused INTEGER NOT NULL DEFAULT 0,
+  paused_at INTEGER,
+  paused_by TEXT
+);
 ";
 
 pub fn now_ms() -> i64 {
@@ -336,6 +342,35 @@ impl Db {
             }
             Ok(done)
         })
+    }
+
+    /// Pauses or resumes a source. Paused is an operational state kept here, not
+    /// in the source's definition file.
+    pub fn set_paused(&self, feed: &str, paused: bool, by: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO source_state (feed_id, paused, paused_at, paused_by) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(feed_id) DO UPDATE SET paused = excluded.paused, paused_at = excluded.paused_at, paused_by = excluded.paused_by",
+                params![feed, paused, paused.then(now_ms), if paused { by } else { None }],
+            )
+            .map(drop)
+        })
+    }
+
+    /// When and by whom a source was paused, if it is.
+    pub fn paused_state(&self, feed: &str) -> Result<Option<(i64, Option<String>)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT paused_at, paused_by FROM source_state WHERE feed_id = ?1 AND paused = 1",
+                params![feed],
+                |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or_default(), r.get(1)?)),
+            )
+            .optional()
+        })
+    }
+
+    pub fn is_paused(&self, feed: &str) -> Result<bool> {
+        Ok(self.paused_state(feed)?.is_some())
     }
 
     pub fn last_received_at(&self, feed: &str) -> Result<Option<i64>> {

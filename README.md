@@ -1,17 +1,17 @@
 # Helios Integration Engine
 
-Gets data from source feeds into HFS, the Helios FHIR Server:
-- **Feeds:** a folder or an S3 bucket today; databases and other FHIR servers later.
+Gets data from sources into HFS, the Helios FHIR Server:
+- **Sources:** a folder or an S3 bucket today; databases and other FHIR servers later. Created and managed through the API, persisted as YAML files.
 - **Formats:** CSV, NDJSON, FHIR Bundle files.
 - **Transforms:** in Python.
 - **Delivery:** idempotent, with retries.
-- **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this feed went quiet".
+- **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this source went quiet".
 
-The engine is a Rust service that runs on Linux (see the `Dockerfile`; CI builds and tests it on Ubuntu). This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1), and the choice of stack in [discussion #2](https://github.com/HeliosSoftware/hie/discussions/2).
+The engine is a Rust service that runs on Linux (see the `Dockerfile`; CI builds and tests it on Ubuntu). This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1), the choice of stack in [discussion #2](https://github.com/HeliosSoftware/hie/discussions/2), and the shared runtime for user code in [discussion #3](https://github.com/HeliosSoftware/hie/discussions/3).
 
 ## What the prototype does
 
-Run against a real HFS (SQLite) with the example lab feed:
+Run against a real HFS (SQLite) with the example lab source:
 
 | Scenario | Result |
 |---|---|
@@ -25,11 +25,11 @@ Run against a real HFS (SQLite) with the example lab feed:
 
 And with Synthea output for three patients, in both of its FHIR shapes:
 
-| Feed | Input | Result |
+| Source | Input | Result |
 |---|---|---|
-| `fhir_bundle` | 3 transaction Bundles (394 to 700 entries each, `urn:uuid` references between entries) | 1,775 resources delivered by id, 0 rejected. References rewritten to `Type/id`: an `Observation.subject` in HFS reads `Patient/bfc9…`. |
+| `fhir_bundle` | 3 transaction Bundles (394 to 700 entries each, `urn:uuid` references between entries) | 1,775 resources delivered by id, 0 rejected. References rewritten to `Type/id`. |
 | `ndjson` | 17 files, one per resource type, from Synthea's bulk-data export | 1,775 resources delivered, 0 rejected. |
-| Both together | The same patients twice, in two formats | HFS holds each resource once: 3 `Patient`, 214 `Encounter`, 415 `Observation`. Both feeds finished in 17 s on a laptop, Python transform included. |
+| Both together | The same patients twice, in two formats | HFS holds each resource once: 3 `Patient`, 214 `Encounter`, 415 `Observation`. Both sources finished in 17 s on a laptop, Python transform included. |
 
 ## Run it
 
@@ -39,10 +39,10 @@ You need:
 - HFS running at the URL in `hie.yaml` (default `http://localhost:8080`).
 
 ```sh
-cargo run -- check          # validate hie.yaml and feeds/
-cargo run                   # watch feeds, serve the API on 127.0.0.1:8090
+cargo run -- check          # validate hie.yaml and sources/
+cargo run                   # run every source, serve the API on 127.0.0.1:8090
 cp examples/data/labs.csv inbox/lab-results/
-curl localhost:8090/api/feeds
+curl localhost:8090/api/sources
 ```
 
 On Linux, in a container:
@@ -59,15 +59,15 @@ docker run --rm -p 8090:8090 -v $PWD/inbox:/hie/inbox hie
 | `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
 
-## Adding a feed
+## Sources
 
-A feed is a YAML file in `feeds/` plus a transform:
+A source is one connection: where the data comes from, its format, the transform that turns it into FHIR, how it is delivered, and how often data is expected. Each source is one YAML file in `sources/`, which the engine reads at start and **writes when a source is created or replaced through the API**, so definitions stay under version control either way.
 
 ```yaml
 id: lab-results
 name: Lab results
 source:
-  type: folder               # or s3 (see feeds/synthea-s3.yaml.example)
+  type: folder               # or s3 (see sources/synthea-s3.yaml.example)
   path: inbox/lab-results
   pattern: "*.csv"
   poll_seconds: 5
@@ -81,6 +81,10 @@ expect_every: 24h            # alert when nothing arrives for this long
 ```
 
 An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO.
+
+The same document is what `POST /api/sources` takes. Before creating one, `POST /api/sources/test` with `{"source": {...}}` lists the connection once and answers with the evidence: reachable or not, in how many milliseconds, how many objects match, and the newest one.
+
+## Transforms
 
 ```python
 from hie import DataError
@@ -102,25 +106,33 @@ def transform(record, context):
 
 ## API
 
-| Method and path | Returns |
+| Method and path | Does |
 |---|---|
-| `GET /api/feeds` | Each feed: freshness (`ok`, `silent`, `no_data_yet`), record counts by status, last file, last alert |
-| `GET /api/feeds/{id}/files` | Files received, with duplicates and per-file sent/rejected counts |
-| `GET /api/records?feed=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
+| `GET /api/sources` | Every source: definition, state (`waiting`, `receiving`, `late`, `paused`), freshness, record counts, last file, last alert |
+| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid |
+| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at` |
+| `GET /api/sources/{id}` | One source, as above |
+| `PUT /api/sources/{id}` | Replaces the definition and restarts the source |
+| `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
+| `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
+| `POST /api/sources/{id}/resume` | Resumes and passes at once |
+| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
+| `GET /api/sources/{id}/files` | Files received, with duplicates and per-file sent/rejected counts |
+| `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?feed=` | Alerts, newest first |
-| `GET /metrics` | Prometheus text: records by status, last received time, alerts by kind |
+| `GET /api/alerts?source=` | Alerts, newest first |
+| `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok"}` |
 
 ## Layout
 
 ```
 src/            engine: config, sources (folder, S3), readers (CSV, NDJSON, Bundle), transform worker,
-                FHIR delivery, pipeline, API, alerts, storage
+                FHIR delivery, pipeline, the source manager, API, alerts, storage
 hie_runtime/    Python side of the transform protocol (worker.py, hie.DataError)
 transforms/     Python transforms: lab_results.py (CSV to Observation), fhir_passthrough.py
-feeds/          one YAML file per feed
+sources/        one YAML file per source; the API writes here too
 examples/data/  sample files used by the tests and the demo
 tests/          end-to-end Rust tests with a stand-in FHIR server; Python tests for the transform
 docs/           design decisions
@@ -134,6 +146,6 @@ python -m unittest tests/test_lab_results.py
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder feed: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store: an NDJSON export delivered by id and archived under the processed prefix.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
 
 They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.

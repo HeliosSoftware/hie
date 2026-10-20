@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -14,10 +14,15 @@ pub struct Config {
     pub listen: String,
     #[serde(default = "default_python")]
     pub python: String,
-    #[serde(default = "default_feeds_dir")]
-    pub feeds_dir: PathBuf,
+    /// One YAML file per source. The engine writes here when a source is created
+    /// through the API, so the definitions stay files under version control.
+    #[serde(default = "default_sources_dir", alias = "feeds_dir")]
+    pub sources_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
+    #[serde(skip)]
+    pub base_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -25,7 +30,9 @@ pub struct AlertConfig {
     pub webhook_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A source: one connection, its format, its transform, how it is delivered and
+/// how often data is expected. Serialized as the source's YAML file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedConfig {
     pub id: String,
     pub name: String,
@@ -35,13 +42,17 @@ pub struct FeedConfig {
     pub transform: PathBuf,
     #[serde(default)]
     pub delivery: DeliveryConfig,
-    #[serde(default, rename = "expect_every")]
-    expect_every_text: Option<String>,
+    #[serde(
+        default,
+        rename = "expect_every",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) expect_every_text: Option<String>,
     #[serde(skip)]
     pub expect_every: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     Folder {
@@ -52,6 +63,7 @@ pub enum SourceConfig {
         poll_seconds: u64,
         #[serde(default = "default_min_file_age_ms")]
         min_file_age_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         archive: Option<PathBuf>,
     },
     /// An S3 bucket. Credentials come from the usual AWS environment
@@ -60,8 +72,10 @@ pub enum SourceConfig {
         bucket: String,
         #[serde(default)]
         prefix: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
         /// For S3-compatible stores such as MinIO.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint: Option<String>,
         #[serde(default = "default_pattern")]
         pattern: String,
@@ -74,7 +88,7 @@ pub enum SourceConfig {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Format {
     #[default]
@@ -83,7 +97,7 @@ pub enum Format {
     FhirBundle,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -119,8 +133,8 @@ fn default_python() -> String {
         "python3".into()
     }
 }
-fn default_feeds_dir() -> PathBuf {
-    PathBuf::from("feeds")
+fn default_sources_dir() -> PathBuf {
+    PathBuf::from("sources")
 }
 fn default_pattern() -> String {
     "*".into()
@@ -148,7 +162,7 @@ fn default_alert_after_attempts() -> u32 {
 }
 
 impl SourceConfig {
-    /// Where the feed reads from, for logs and the API.
+    /// Where the source reads from, for logs and the API.
     pub fn describe(&self) -> String {
         match self {
             SourceConfig::Folder { path, .. } => path.display().to_string(),
@@ -163,20 +177,40 @@ impl SourceConfig {
             }
         }
     }
-}
 
-impl FeedConfig {
-    fn resolve(&mut self, base: &Path) -> Result<()> {
-        if let SourceConfig::Folder { path, archive, .. } = &mut self.source {
+    /// Makes a folder's paths absolute against the directory holding `hie.yaml`.
+    pub fn resolve(&mut self, base: &Path) {
+        if let SourceConfig::Folder { path, archive, .. } = self {
             *path = base.join(&*path);
             if let Some(a) = archive {
                 *a = base.join(&*a);
             }
         }
+    }
+}
+
+impl FeedConfig {
+    /// Makes the paths absolute, checks the transform exists and parses `expect_every`.
+    pub fn resolve(&mut self, base: &Path) -> Result<()> {
+        if self.id.is_empty()
+            || !self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            bail!(
+                "source id {:?} must be lowercase letters, digits and dashes",
+                self.id
+            );
+        }
+        if self.name.trim().is_empty() {
+            bail!("source {}: name is required", self.id);
+        }
+        self.source.resolve(base);
         self.transform = base.join(&self.transform);
         if !self.transform.is_file() {
             bail!(
-                "feed {}: transform {} not found",
+                "source {}: transform {} not found",
                 self.id,
                 self.transform.display()
             );
@@ -186,12 +220,17 @@ impl FeedConfig {
             .as_deref()
             .map(parse_duration)
             .transpose()
-            .with_context(|| format!("feed {}: expect_every", self.id))?;
+            .with_context(|| format!("source {}: expect_every", self.id))?;
         Ok(())
+    }
+
+    /// The source's YAML file, as submitted (paths as given, not resolved).
+    pub fn to_yaml(&self) -> Result<String> {
+        Ok(serde_yaml::to_string(self)?)
     }
 }
 
-/// Loads `hie.yaml` and every feed definition in its `feeds_dir`.
+/// Loads `hie.yaml` and every source definition in its `sources_dir`.
 /// Relative paths resolve against the directory holding `hie.yaml`.
 pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let text =
@@ -199,12 +238,15 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let mut config: Config =
         serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    config.base_dir = base.clone();
     config.database = base.join(&config.database);
-    config.feeds_dir = base.join(&config.feeds_dir);
+    config.sources_dir = base.join(&config.sources_dir);
+    std::fs::create_dir_all(&config.sources_dir)
+        .with_context(|| format!("creating {}", config.sources_dir.display()))?;
 
     let mut feeds = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&config.feeds_dir)
-        .with_context(|| format!("reading {}", config.feeds_dir.display()))?
+    let mut entries: Vec<_> = std::fs::read_dir(&config.sources_dir)
+        .with_context(|| format!("reading {}", config.sources_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
         .collect();
@@ -216,7 +258,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
             .with_context(|| format!("parsing {}", feed_path.display()))?;
         feed.resolve(&base)?;
         if !ids.insert(feed.id.clone()) {
-            bail!("duplicate feed id {}", feed.id);
+            bail!("duplicate source id {}", feed.id);
         }
         feeds.push(feed);
     }
@@ -278,13 +320,18 @@ mod tests {
     }
 
     #[test]
-    fn an_s3_source_parses_with_defaults() {
+    fn an_s3_source_parses_with_defaults_and_round_trips() {
         let feed: FeedConfig = serde_yaml::from_str(
-            "id: x\nname: X\nsource:\n  type: s3\n  bucket: lab\n  prefix: results/\nformat: ndjson\ntransform: t.py\n",
+            "id: x\nname: X\nsource:\n  type: s3\n  bucket: lab\n  prefix: results/\nformat: ndjson\ntransform: t.py\nexpect_every: 24h\n",
         )
         .unwrap();
         assert_eq!(feed.format, Format::Ndjson);
         assert_eq!(feed.source.describe(), "s3://lab/results/");
+        let yaml = feed.to_yaml().unwrap();
+        let again: FeedConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(again.source.describe(), "s3://lab/results/");
+        assert!(yaml.contains("expect_every: 24h"));
+        assert!(!yaml.contains("region"));
         match feed.source {
             SourceConfig::S3 {
                 pattern,
@@ -296,5 +343,24 @@ mod tests {
             ),
             _ => panic!("expected s3"),
         }
+    }
+
+    #[test]
+    fn source_ids_are_checked_on_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+        let mut feed: FeedConfig = serde_yaml::from_str(
+            "id: Bad Id\nname: X\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n",
+        )
+        .unwrap();
+        assert!(
+            feed.resolve(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("lowercase")
+        );
+        feed.id = "good-id".into();
+        feed.resolve(dir.path()).unwrap();
+        assert!(feed.transform.is_absolute());
     }
 }

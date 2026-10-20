@@ -6,6 +6,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod fhir;
+pub mod manager;
 pub mod pipeline;
 pub mod reader;
 pub mod source;
@@ -16,34 +17,20 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-/// Builds one runner per feed plus the API state, sharing a database and HFS client.
+/// Opens the store and the HFS client, starts every configured source, and returns
+/// the manager (which owns the runners) and the API state.
 pub fn build(
     config: &config::Config,
     feeds: Vec<config::FeedConfig>,
     runtime_dir: &Path,
-) -> Result<(Vec<Arc<pipeline::FeedRunner>>, api::AppState)> {
+) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::open(&config.database)?);
     let fhir = Arc::new(fhir::FhirClient::new(&config.fhir_base_url));
     let alerts = Arc::new(alerts::Alerter::new(
         db.clone(),
         config.alerts.webhook_url.clone(),
     ));
-    let mut runners = Vec::with_capacity(feeds.len());
-    for feed in feeds.iter().cloned() {
-        runners.push(Arc::new(pipeline::FeedRunner::new(
-            feed,
-            db.clone(),
-            fhir.clone(),
-            alerts.clone(),
-            &config.python,
-            runtime_dir,
-        )?));
-    }
-    Ok((
-        runners,
-        api::AppState {
-            db,
-            feeds: Arc::new(feeds),
-        },
-    ))
+    let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts);
+    manager.start_all(feeds)?;
+    Ok((manager.clone(), api::AppState { db, manager }))
 }

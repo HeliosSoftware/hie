@@ -16,7 +16,7 @@ WORKDIR /hie
 COPY --from=build /src/target/release/hie /usr/local/bin/hie
 COPY hie_runtime/ /hie/hie_runtime/
 COPY transforms/ /hie/transforms/
-COPY feeds/ /hie/feeds/
+COPY sources/ /hie/sources/
 COPY hie.yaml /hie/hie.yaml
 ENV HIE_CONFIG=/hie/hie.yaml \
     HIE_RUNTIME_DIR=/hie/hie_runtime \

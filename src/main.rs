@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     if matches!(cli.command, Some(Command::Check)) {
         println!(
-            "config ok: {} feed(s), HFS at {}",
+            "config ok: {} source(s), HFS at {}",
             feeds.len(),
             config.fhir_base_url
         );
@@ -62,10 +62,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (runners, state) = hie::build(&config, feeds, &runtime_dir)?;
-    for runner in runners {
-        tokio::spawn(runner.run());
-    }
+    let (_manager, state) = hie::build(&config, feeds, &runtime_dir)?;
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
