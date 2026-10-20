@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Docker runs on the shared Docker server, not the runner, as in hfs's ci.yml.
+env:
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+
 jobs:
   test:
     name: Test (Linux)
@@ -15,28 +19,36 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Transform tests
-        run: python -m unittest tests/test_lab_results.py
+        run: python3 -m unittest tests/test_lab_results.py
       - name: Engine tests
         run: cargo test
         env:
-          HIE_TEST_PYTHON: python
+          HIE_TEST_PYTHON: python3
 
   image:
     name: Container image (Linux)
     runs-on: self-hosted
+    env:
+      # The Docker server is shared, so the tag is per run.
+      IMAGE: hie:ci-${{ github.run_id }}
     steps:
+      - name: Verify DOCKER_HOST is set
+        if: env.DOCKER_HOST == ''
+        run: |
+          echo "::error::DOCKER_HOST secret is not set. The image is built on the shared Docker server."
+          exit 1
       - uses: actions/checkout@v4
       - name: Build
-        run: docker build -t hie:ci .
+        run: docker build -t "$IMAGE" .
       - name: Smoke test
         run: |
-          docker run --rm hie:ci check
-          docker run --rm --entrypoint python3 hie:ci --version
+          docker run --rm "$IMAGE" check
+          docker run --rm --entrypoint python3 "$IMAGE" --version
+      - name: Remove image
+        if: always()
+        run: docker rmi -f "$IMAGE" || true

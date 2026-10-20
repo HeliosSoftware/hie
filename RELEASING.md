@@ -15,7 +15,8 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
 
 2. Ensure you can push to `main` and push tags on [HeliosSoftware/hie](https://github.com/HeliosSoftware/hie).
 
-3. Ensure the deploy secrets are set on the repository (Settings → Secrets and variables → Actions):
+3. Ensure the secrets are set on the repository (Settings → Secrets and variables → Actions):
+   - `DOCKER_HOST` (required): the shared Docker server, the same value hfs uses. Every image build and `docker run` in CI and the release runs there, not on the runner.
    - `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER` (required)
    - `HIE_DEPLOY_PORT`, `HIE_FHIR_BASE_URL`, `HIE_PUBLIC_URL` (optional; defaults in the workflow)
    - `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER`, `HIE_AUTH_AUDIENCE` (only for a secure environment; without them the API is deployed open, like the public sandbox)
@@ -30,8 +31,8 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-python -m unittest tests/test_lab_results.py
-HIE_TEST_PYTHON=python cargo test
+python3 -m unittest tests/test_lab_results.py
+HIE_TEST_PYTHON=python3 cargo test
 docker build -t hie:local . && docker run --rm hie:local check
 ```
 - Check in any changes.

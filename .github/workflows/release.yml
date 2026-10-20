@@ -9,6 +9,8 @@ on:
 
 env:
   TARGET: x86_64-unknown-linux-gnu
+  # Docker runs on the shared Docker server, not the runner, as in hfs's ci.yml.
+  DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
 
 jobs:
   build:
@@ -67,6 +69,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Verify DOCKER_HOST is set
+        if: env.DOCKER_HOST == ''
+        run: |
+          echo "::error::DOCKER_HOST secret is not set. The image is built on the shared Docker server."
+          exit 1
       - uses: actions/checkout@v4
       - name: Version
         id: version
