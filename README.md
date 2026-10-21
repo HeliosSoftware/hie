@@ -36,7 +36,7 @@ And with Synthea output for three patients, in both of its FHIR shapes:
 You need:
 - Rust 1.90 or later;
 - Python 3.8 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it);
-- HFS running at the URL in `hie.yaml` (default `http://localhost:8080`).
+- HFS running at the URL in `hie.yaml` (default `http://localhost:8080`), with its search parameters loaded (`HFS_DATA_DIR`): a row delivered by business identifier is a conditional `PUT Type?identifier=...`, which HFS refuses with `400` when it does not know `identifier` for that type, and the engine then rejects the row as a data error.
 
 ```sh
 cargo run -- check          # validate hie.yaml and sources/
