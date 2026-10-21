@@ -87,7 +87,7 @@ async fn a_table_is_read_past_a_cursor_and_nothing_twice() {
     .unwrap();
     let insert = |pool: sqlx::SqlitePool, id: i64, value: f64| async move {
         sqlx::query(
-            "INSERT INTO lab_results VALUES (?1, ?2, '2345-7', 'Glucose', ?3, 'mg/dL', ?4)",
+            "INSERT INTO lab_results VALUES ($1, $2, '2345-7', 'Glucose', $3, 'mg/dL', $4)",
         )
         .bind(id)
         .bind(format!("Patient/{id}"))

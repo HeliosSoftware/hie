@@ -39,6 +39,30 @@ pub struct FeedRunner {
     alerts: Arc<Alerter>,
     started_at: i64,
     outage_alerted: AtomicBool,
+    /// Which engine instance this runner acts as, for the source's lease.
+    instance: String,
+}
+
+/// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
+/// or the host, the process id and a random tail.
+pub fn instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("HIE_INSTANCE_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| {
+                use rand::Rng;
+                let host = std::env::var("COMPUTERNAME")
+                    .or_else(|_| std::env::var("HOSTNAME"))
+                    .unwrap_or_else(|_| "hie".into());
+                format!(
+                    "{host}-{}-{:04x}",
+                    std::process::id(),
+                    rand::thread_rng().r#gen::<u16>()
+                )
+            })
+    })
 }
 
 impl FeedRunner {
@@ -95,6 +119,7 @@ impl FeedRunner {
             transformer,
             alerts,
             started_at: now_ms(),
+            instance: instance_id().to_string(),
             outage_alerted: AtomicBool::new(false),
         }
     }
@@ -108,33 +133,62 @@ impl FeedRunner {
         self.started_at
     }
 
+    /// Runs the passes as this instance instead of the process-wide one; for
+    /// tests that put two instances on one store.
+    pub fn as_instance(mut self, id: &str) -> Self {
+        self.instance = id.to_string();
+        self
+    }
+
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// How long a pass may hold the source before another instance may take it:
+    /// a few polls, and never less than half a minute.
+    fn lease_ttl_ms(&self) -> i64 {
+        (self.feed.source.poll_interval().as_millis() as i64 * 3).max(30_000)
+    }
+
+    /// One pass as this instance: takes or renews the source's lease, then runs
+    /// the pipeline unless the source is paused. `false` when another instance
+    /// holds the source, in which case nothing ran.
+    pub async fn pass(&self) -> Result<bool> {
+        if !self
+            .db
+            .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+        {
+            tracing::debug!(feed = %self.feed.id, "held by another instance; standing by");
+            return Ok(false);
+        }
+        if let Err(e) = self.source.start().await {
+            tracing::error!(feed = %self.feed.id, "{e:#}");
+            self.alerts.raise(
+                Some(&self.feed.id),
+                "listener",
+                &format!("{}: {e:#}", self.feed.name),
+            )?;
+        }
+        if !self.db.is_paused(&self.feed.id)? {
+            self.tick().await?;
+        }
+        Ok(true)
+    }
+
     /// The feed's loop: a pass every poll interval, or sooner when poked; nothing
-    /// while the source is paused; until stopped.
+    /// while the source is paused or held by another instance; until stopped.
     pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {
-        tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), "watching");
+        tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), instance = %self.instance, "watching");
         loop {
             if control.stopped.load(Ordering::Acquire) {
+                if let Err(e) = self.db.release_lease(&self.feed.id, &self.instance) {
+                    tracing::error!(feed = %self.feed.id, "{e:#}");
+                }
                 tracing::info!(feed = %self.feed.id, "stopped");
                 return;
             }
-            if let Err(e) = self.source.start().await {
+            if let Err(e) = self.pass().await {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
-                if let Err(e) = self.alerts.raise(
-                    Some(&self.feed.id),
-                    "listener",
-                    &format!("{}: {e:#}", self.feed.name),
-                ) {
-                    tracing::error!(feed = %self.feed.id, "{e:#}");
-                }
-            }
-            match self.db.is_paused(&self.feed.id) {
-                Ok(true) => {}
-                Ok(false) => {
-                    if let Err(e) = self.tick().await {
-                        tracing::error!(feed = %self.feed.id, "{e:#}");
-                    }
-                }
-                Err(e) => tracing::error!(feed = %self.feed.id, "{e:#}"),
             }
             tokio::select! {
                 _ = tokio::time::sleep(self.feed.source.poll_interval()) => {}
@@ -494,8 +548,8 @@ impl FeedRunner {
     async fn archive_submission(&self, token: &str) -> Result<()> {
         let file_ids: Vec<i64> = {
             let rows = self.db.query_json(
-                "SELECT DISTINCT file_id FROM records WHERE submission = ?1",
-                rusqlite::params![token],
+                "SELECT DISTINCT file_id FROM records WHERE submission = $1",
+                crate::db::params![token],
             )?;
             rows.iter().filter_map(|r| r["file_id"].as_i64()).collect()
         };

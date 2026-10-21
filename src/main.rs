@@ -34,7 +34,15 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let (config, feeds) = hie::config::load(&cli.config)?;
+    let (mut config, feeds) = hie::config::load(&cli.config)?;
+    // The store may be a PostgreSQL URL with a password: it comes from the
+    // environment, never from the file.
+    if let Some(url) = std::env::var("HIE_DATABASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        config.database = PathBuf::from(url);
+    }
     let runtime_dir = std::env::var_os("HIE_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

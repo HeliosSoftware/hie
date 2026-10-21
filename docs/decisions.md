@@ -160,7 +160,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - No setup, runs anywhere, enough for one engine instance.
 - The schema is plain SQL with nothing SQLite-specific beyond types, so moving to PostgreSQL (the planned stack) is a driver change and a migration.
 
-**Cost:** One instance at a time. Running several, or high availability, needs PostgreSQL.
+**Cost:** One instance at a time. Running several, or high availability, needs PostgreSQL. (Decision 28 adds PostgreSQL behind the same SQL, and leases for several instances.)
 
 ## 14. Source robustness: encodings and malformed rows
 
@@ -320,6 +320,20 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Cost / not yet:** no TLS on the listener (front it with a TLS proxy or a VPN, as is usual for MLLP); no batch (`BHS`/`BTS`) or `FHS` files; no outbound MLLP (sending ACK-dependent results back); `MSH-9.3` structure codes are not validated; one ACK per message, so a sender that pipelines many frames gets them in order but waits for each disk write.
 
+## 28. One store written once, on SQLite or PostgreSQL; one instance per source, by lease
+
+**Chosen:** The store's SQL is written once, with `$N` placeholders and only what both engines share (`RETURNING id`, `ON CONFLICT DO UPDATE`, `IS NOT DISTINCT FROM`, `CASE` instead of boolean sums, integer epoch milliseconds instead of date types). `database:` in `hie.yaml` is a SQLite file path or a `postgres://` URL; `HIE_DATABASE_URL` overrides it so the password stays out of the file. PostgreSQL goes through the synchronous `postgres` client on a thread of its own, called over a channel, so the async runtime is never asked to block on another runtime. Every store the tests open can be pointed at a PostgreSQL with `HIE_TEST_DATABASE_URL`; each test gets a schema of its own and drops it.
+
+Several engine instances may share one PostgreSQL. A source is run by the instance that holds its **lease** (`source_leases`): a pass takes or renews the lease for three poll intervals (at least 30 s) and runs; an instance that finds the lease held stands by; a lease that lapses, because its holder died, is taken by the next pass of another instance; a clean stop releases it. The API shows the holder (`lease`, `instance`) and reports a source held elsewhere as `standby`. Pause, resume, rules and cursors live in the store, so they apply whichever instance runs the source.
+
+**Why:**
+- A second machine, a restart without losing in-flight work, or a database the operators already back up: all three want PostgreSQL, and all three are the first things a production asks for.
+- One SQL text for both engines keeps SQLite as the no-setup default (a laptop, the public sandbox, the test suite) without a second store to maintain; the test suite on PostgreSQL is the proof the two behave the same.
+- A lease per source rather than a lock per record: the sources are the unit of ownership people reason about ("who is running the lab feed?"), the folder and MLLP sources cannot be shared across machines anyway, and a pulling source with a cursor must not be pulled by two instances at once. Record-level claims, for throughput on one feed, can be added under the lease later.
+- The synchronous client on its own thread rather than an async store: the pipeline calls the store from many places; making them all async would have touched every call site for no gain, since a SQLite call blocks the same way.
+
+**Cost / not yet:** no TLS to PostgreSQL yet (same host or a private network); one connection per instance, no pool; a `check-now` reaches only the instance it was sent to; no per-record parallelism within a source.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.
@@ -328,4 +342,4 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - Patient matching (source identifier to `Patient` reference).
 - Authentication to HFS with a private-key JWT (SMART backend services); client credentials are in.
 - `$bulk-submit` delivery (HFS fetches a manifest and NDJSON files, which can live on S3).
-- PostgreSQL, multiple instances, a UI, FHIR Mapping Language.
+- A UI, FHIR Mapping Language, record-level parallelism within one source.

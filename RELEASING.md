@@ -21,6 +21,7 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
    - `HIE_DEPLOY_PORT`, `HIE_FHIR_BASE_URL`, `HIE_PUBLIC_URL` (optional; defaults in the workflow)
    - `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER`, `HIE_AUTH_AUDIENCE` (only for a secure environment; without them the API is deployed open, like the public sandbox)
    - `HIE_FHIR_TOKEN_URL`, `HIE_FHIR_CLIENT_ID`, `HIE_FHIR_CLIENT_SECRET`, `HIE_FHIR_SCOPE` (only for a secure environment whose HFS requires a token; without them the engine calls HFS anonymously, as the sandbox does against the public HFS)
+   - `HIE_DATABASE_URL` (optional: a `postgres://` URL for a shared store; without it the engine keeps its SQLite file under `/opt/hie/data`)
 
 4. Ensure the self-hosted runners are online. Every job runs on `self-hosted`; the deploy job needs a runner labelled `Deploy` whose user can SSH to `HIE_DEPLOY_USER@HIE_DEPLOY_HOST` with a key in its `~/.ssh`. That user needs passwordless `sudo` on the host.
 

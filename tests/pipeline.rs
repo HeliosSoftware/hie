@@ -252,8 +252,8 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     let fixed = state
         .db
         .query_json(
-            "SELECT raw, original_raw FROM records WHERE id = ?1",
-            [alto[0]["id"].as_i64().unwrap()],
+            "SELECT raw, original_raw FROM records WHERE id = $1",
+            hie::db::params![alto[0]["id"].as_i64().unwrap()],
         )
         .unwrap();
     assert_eq!(fixed[0]["raw"]["value"], "101");

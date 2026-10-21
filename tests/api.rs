@@ -24,6 +24,10 @@ async fn batch(State(urls): State<Urls>, Json(bundle): Json<Value>) -> Json<Valu
 }
 
 async fn serve(router: Router) -> String {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("hie=warn")
+        .with_test_writer()
+        .try_init();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

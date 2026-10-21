@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use crate::db::{Param, params};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -116,12 +116,7 @@ async fn bulk_file(
     Ok(([(header::CONTENT_TYPE, "application/fhir+ndjson")], bytes).into_response())
 }
 
-const ISO: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', {}/1000.0, 'unixepoch')";
 const DAY_MS: i64 = 86_400_000;
-
-fn iso(col: &str) -> String {
-    ISO.replace("{}", col)
-}
 
 struct ApiError(StatusCode, String);
 
@@ -133,6 +128,7 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        tracing::error!("API request failed: {e:#}");
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
     }
 }
@@ -158,7 +154,7 @@ fn iso_ms(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339())
 }
 
-fn count(db: &Db, sql: &str, p: impl rusqlite::Params) -> anyhow::Result<i64> {
+fn count(db: &Db, sql: &str, p: impl Into<Vec<Param>>) -> anyhow::Result<i64> {
     Ok(db
         .query_json(sql, p)?
         .first()
@@ -172,6 +168,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
     let last = db.last_received_at(&feed.id)?;
     let paused = db.paused_state(&feed.id)?;
+    let lease = db.lease(&feed.id)?;
     let started = s
         .manager
         .runner(&feed.id)
@@ -190,13 +187,13 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         _ => "receiving",
     };
     let last_alert = db.query_json(
-        &format!("SELECT kind, message, {} AS created_at FROM alerts WHERE feed_id = ?1 ORDER BY id DESC LIMIT 1", iso("created_at")),
+        &format!("SELECT kind, message, {} AS created_at FROM alerts WHERE feed_id = $1 ORDER BY id DESC LIMIT 1", db.iso("created_at")),
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
     let rejected_24h = count(
         db,
-        "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'rejected' AND updated_at >= ?2",
+        "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2",
         params![feed.id, since],
     )?;
     Ok(json!({
@@ -207,9 +204,11 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "transform": feed.transform.display().to_string(),
         "poll_seconds": feed.source.poll_interval().as_secs(),
         "expect_every": feed.expect_every.map(human),
-        "state": state,
+        "state": if state != "paused" && lease.as_ref().is_some_and(|l| l.owner != crate::pipeline::instance_id()) { "standby" } else { state },
         "freshness": freshness,
         "paused": paused.map(|(at, by)| json!({"since": iso_ms(at), "by": by})),
+        "lease": lease.map(|l| json!({"owner": l.owner, "until": iso_ms(l.until), "mine": l.owner == crate::pipeline::instance_id()})),
+        "instance": crate::pipeline::instance_id(),
         "last_received_at": last.and_then(iso_ms),
         "records": db.feed_counts(&feed.id)?,
         "rejected_last_24h": rejected_24h,
@@ -335,8 +334,11 @@ async fn source_stats(
         })
         .collect();
     for row in s.db.query_json(
-        "SELECT date(received_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM files
-         WHERE feed_id = ?1 AND status <> 'duplicate' AND received_at >= ?2 GROUP BY day",
+        &format!(
+            "SELECT {} AS day, COUNT(*) AS n FROM files
+             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 GROUP BY 1",
+            s.db.day("received_at")
+        ),
         params![id, since],
     )? {
         if let Some(entry) = row["day"].as_str().and_then(|d| by_day.get_mut(d)) {
@@ -344,8 +346,11 @@ async fn source_stats(
         }
     }
     for row in s.db.query_json(
-        "SELECT date(updated_at / 1000, 'unixepoch') AS day, status, COUNT(*) AS n FROM records
-         WHERE feed_id = ?1 AND status IN ('sent', 'rejected') AND updated_at >= ?2 GROUP BY day, status",
+        &format!(
+            "SELECT {} AS day, status, COUNT(*) AS n FROM records
+             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 GROUP BY 1, status",
+            s.db.day("updated_at")
+        ),
         params![id, since],
     )? {
         if let (Some(entry), Some(status)) = (
@@ -366,11 +371,11 @@ async fn source_stats(
         .and_utc()
         .timestamp_millis();
     let today_json = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = ?1 AND status <> 'duplicate' AND received_at >= ?2", params![id, today_since])?,
-        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = ?1 AND f.received_at >= ?2", params![id, today_since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'sent' AND updated_at >= ?2", params![id, today_since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status = 'rejected' AND updated_at >= ?2", params![id, today_since])?,
-        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = ?1 AND status IN ('received', 'pending')", params![id])?,
+        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2", params![id, today_since])?,
+        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2", params![id, today_since])?,
+        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'sent' AND updated_at >= $2", params![id, today_since])?,
+        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2", params![id, today_since])?,
+        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
     });
     Ok(Json(
         json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
@@ -460,10 +465,10 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
     }
     let since = now_ms() - DAY_MS;
     let last_24h = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= ?1", params![since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= ?1", params![since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= ?1", params![since])?,
-        "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= ?1", params![since])?,
+        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
+        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
+        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
+        "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
     });
     Ok(Json(json!({
         "state": if needs_you.is_empty() { "all_receiving" } else { "needs_you" },
@@ -480,9 +485,9 @@ struct Limit {
 
 const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                     COUNT(r.id) AS records,
-                    COALESCE(SUM(r.status = 'sent'), 0) AS sent,
-                    COALESCE(SUM(r.status = 'rejected'), 0) AS rejected,
-                    COALESCE(SUM(r.status IN ('received', 'pending', 'submitted')), 0) AS in_progress,
+                    CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT) AS sent,
+                    CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected,
+                    CAST(COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) AS BIGINT) AS in_progress,
                     CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms";
 
 /// A load is one file (or object) and what became of its rows. The same rows serve
@@ -501,9 +506,9 @@ async fn list_files(
         &format!(
             "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.feed_id = ?1 GROUP BY f.id ORDER BY f.id DESC LIMIT ?2",
-            iso("f.received_at"),
-            iso("f.finished_at")
+             WHERE f.feed_id = $1 GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at ORDER BY f.id DESC LIMIT $2",
+            s.db.iso("f.received_at"),
+            s.db.iso("f.finished_at")
         ),
         params![id, q.limit.unwrap_or(50)],
     )?;
@@ -521,9 +526,9 @@ async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiRes
             &format!(
                 "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
                  FROM files f LEFT JOIN records r ON r.file_id = f.id
-                 WHERE f.id = ?1 GROUP BY f.id",
-                iso("f.received_at"),
-                iso("f.finished_at")
+                 WHERE f.id = $1 GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at",
+                s.db.iso("f.received_at"),
+                s.db.iso("f.finished_at")
             ),
             params![file_id],
         )?
@@ -554,7 +559,7 @@ async fn retry_load(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let reason = body.and_then(|Json(b)| b.reason);
     let source_id =
-        s.db.query_json("SELECT feed_id FROM files WHERE id = ?1", params![file_id])?
+        s.db.query_json("SELECT feed_id FROM files WHERE id = $1", params![file_id])?
             .into_iter()
             .next()
             .and_then(|r| r["feed_id"].as_str().map(str::to_string))
@@ -583,9 +588,9 @@ async fn list_records(State(s): State<AppState>, Query(q): Query<RecordQuery>) -
             "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, r.line, r.status, r.error_kind, r.error,
                     r.attempts, {} AS updated_at
              FROM records r JOIN files f ON f.id = r.file_id
-             WHERE (?1 IS NULL OR r.feed_id = ?1) AND (?2 IS NULL OR r.status = ?2) AND (?3 IS NULL OR r.file_id = ?3)
-             ORDER BY r.id DESC LIMIT ?4",
-            iso("r.updated_at")
+             WHERE (CAST($1 AS TEXT) IS NULL OR r.feed_id = CAST($1 AS TEXT)) AND (CAST($2 AS TEXT) IS NULL OR r.status = CAST($2 AS TEXT)) AND (CAST($3 AS BIGINT) IS NULL OR r.file_id = CAST($3 AS BIGINT))
+             ORDER BY r.id DESC LIMIT $4",
+            s.db.iso("r.updated_at")
         ),
         params![q.source, q.status, q.file_id, q.limit.unwrap_or(100)],
     )?;
@@ -600,9 +605,9 @@ async fn get_record(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult
                 "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, f.sha256 AS file_sha256, r.line, r.status,
                         r.raw, r.original_raw, r.resources, r.response, r.error_kind, r.error, r.attempts,
                         {} AS received_at, {} AS updated_at
-                 FROM records r JOIN files f ON f.id = r.file_id WHERE r.id = ?1",
-                iso("f.received_at"),
-                iso("r.updated_at")
+                 FROM records r JOIN files f ON f.id = r.file_id WHERE r.id = $1",
+                s.db.iso("f.received_at"),
+                s.db.iso("r.updated_at")
             ),
             params![id],
         )?
@@ -646,10 +651,10 @@ async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> 
             "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
                     {} AS created_at, {} AS cleared_at, cleared_reason
              FROM alerts
-             WHERE (?1 IS NULL OR feed_id = ?1) AND (?3 = 0 OR cleared_at IS NULL)
-             ORDER BY id DESC LIMIT ?2",
-            iso("created_at"),
-            iso("cleared_at")
+             WHERE (CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)) AND (CAST($3 AS BIGINT) = 0 OR cleared_at IS NULL)
+             ORDER BY id DESC LIMIT $2",
+            s.db.iso("created_at"),
+            s.db.iso("cleared_at")
         ),
         params![q.source, q.limit.unwrap_or(100), q.open.unwrap_or(false)],
     )?;

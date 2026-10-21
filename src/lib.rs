@@ -31,7 +31,7 @@ pub fn build(
     auth: auth::Auth,
     credentials: credentials::Credentials,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
-    let db = Arc::new(db::Db::open(&config.database)?);
+    let db = Arc::new(db::Db::connect(&config.database.to_string_lossy())?);
     let fhir = Arc::new(fhir::FhirClient::with_credentials(
         &config.fhir_base_url,
         credentials,
