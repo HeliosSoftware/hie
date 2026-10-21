@@ -623,7 +623,16 @@ impl FhirServerSource {
                 url.push_str(&format!("&_lastUpdated=gt{c}"));
             }
             let bundle = self.get(&url).await?;
-            objects += bundle["total"].as_u64().unwrap_or(0) as usize;
+            // Not every server puts a total on a page (HFS does not); ask for it.
+            let total = match bundle["total"].as_u64() {
+                Some(t) => t,
+                None => self
+                    .get(&url.replace("&_count=1", "&_summary=count"))
+                    .await?["total"]
+                    .as_u64()
+                    .unwrap_or(bundle["entry"].as_array().map_or(0, Vec::len) as u64),
+            };
+            objects += total as usize;
             if let Some(at) = bundle["entry"][0]["resource"]["meta"]["lastUpdated"].as_str()
                 && newest.as_ref().is_none_or(|(_, n)| later(at, n))
             {
