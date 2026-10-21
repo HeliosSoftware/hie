@@ -135,6 +135,26 @@ pub enum SourceConfig {
         #[serde(default = "default_max_pages")]
         max_runs: usize,
     },
+    /// An MLLP listener for HL7 v2: every message received is written to `spool`
+    /// before it is acknowledged, then picked up from there like a file.
+    Mllp {
+        /// Address to listen on, e.g. `0.0.0.0:2575`.
+        listen: String,
+        /// Where received messages wait as files; relative to `hie.yaml`.
+        #[serde(default = "default_spool")]
+        spool: PathBuf,
+        /// How often the spool is picked up.
+        #[serde(default = "default_mllp_poll_seconds")]
+        poll_seconds: u64,
+    },
+}
+
+fn default_spool() -> PathBuf {
+    PathBuf::from("spool")
+}
+
+fn default_mllp_poll_seconds() -> u64 {
+    2
 }
 
 /// Credentials for a remote FHIR server. Secrets are named by environment
@@ -169,6 +189,8 @@ pub enum Format {
     Csv,
     Ndjson,
     FhirBundle,
+    /// HL7 v2 messages, one or more per file, each starting with `MSH`.
+    Hl7v2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +304,9 @@ impl SourceConfig {
                 cursor_column,
                 ..
             } => format!("database ${url_env} by {cursor_column}"),
+            SourceConfig::Mllp { listen, spool, .. } => {
+                format!("mllp://{listen} (spool {})", spool.display())
+            }
         }
     }
 
@@ -290,7 +315,8 @@ impl SourceConfig {
             SourceConfig::Folder { poll_seconds, .. }
             | SourceConfig::S3 { poll_seconds, .. }
             | SourceConfig::FhirServer { poll_seconds, .. }
-            | SourceConfig::Database { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+            | SourceConfig::Database { poll_seconds, .. }
+            | SourceConfig::Mllp { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
         }
     }
 
@@ -350,6 +376,11 @@ impl SourceConfig {
                 bail!("database: max_runs must be at least 1");
             }
         }
+        if let SourceConfig::Mllp { listen, .. } = self
+            && listen.parse::<std::net::SocketAddr>().is_err()
+        {
+            bail!("mllp: listen must be an address such as 0.0.0.0:2575, not {listen:?}");
+        }
         Ok(())
     }
 
@@ -360,6 +391,9 @@ impl SourceConfig {
             if let Some(a) = archive {
                 *a = base.join(&*a);
             }
+        }
+        if let SourceConfig::Mllp { spool, .. } = self {
+            *spool = base.join(&*spool);
         }
     }
 }
@@ -385,22 +419,20 @@ impl FeedConfig {
         self.source
             .check()
             .with_context(|| format!("source {}", self.id))?;
-        if matches!(
-            self.source,
-            SourceConfig::FhirServer { .. } | SourceConfig::Database { .. }
-        ) {
-            // What a server or a query answers is one JSON object per record,
-            // whatever the file says; and there is no object for $bulk-submit to fetch.
-            self.format = Format::Ndjson;
+        // What a server, a query or an MLLP sender hands over has its own shape,
+        // whatever the file says; and there is no object for $bulk-submit to fetch.
+        let fixed = match self.source {
+            SourceConfig::FhirServer { .. } => Some(("fhir_server", Format::Ndjson)),
+            SourceConfig::Database { .. } => Some(("database", Format::Ndjson)),
+            SourceConfig::Mllp { .. } => Some(("mllp", Format::Hl7v2)),
+            _ => None,
+        };
+        if let Some((kind, format)) = fixed {
+            self.format = format;
             if self.delivery.method == DeliveryMethod::BulkSubmit {
                 bail!(
-                    "source {}: a {} source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
-                    self.id,
-                    if matches!(self.source, SourceConfig::Database { .. }) {
-                        "database"
-                    } else {
-                        "fhir_server"
-                    }
+                    "source {}: a {kind} source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
+                    self.id
                 );
             }
         }

@@ -99,6 +99,10 @@ impl FeedRunner {
         }
     }
 
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
     /// When this runner started: the reference for silence until data arrives.
     pub fn started_at(&self) -> i64 {
         self.started_at
@@ -112,6 +116,16 @@ impl FeedRunner {
             if control.stopped.load(Ordering::Acquire) {
                 tracing::info!(feed = %self.feed.id, "stopped");
                 return;
+            }
+            if let Err(e) = self.source.start().await {
+                tracing::error!(feed = %self.feed.id, "{e:#}");
+                if let Err(e) = self.alerts.raise(
+                    Some(&self.feed.id),
+                    "listener",
+                    &format!("{}: {e:#}", self.feed.name),
+                ) {
+                    tracing::error!(feed = %self.feed.id, "{e:#}");
+                }
             }
             match self.db.is_paused(&self.feed.id) {
                 Ok(true) => {}

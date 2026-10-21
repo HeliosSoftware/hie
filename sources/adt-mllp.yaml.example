@@ -1,0 +1,10 @@
+# HL7 v2 ADT messages over MLLP. Copy to adt-mllp.yaml and fill in.
+id: adt-mllp
+name: ADT over MLLP
+source:
+  type: mllp
+  listen: 0.0.0.0:2575     # senders connect here (MLLP framing, one ACK per message)
+  spool: spool/adt         # every message is written here before it is acknowledged
+  poll_seconds: 2          # how often the spool is picked up
+transform: transforms/hl7_adt_patient.py
+expect_every: 1h

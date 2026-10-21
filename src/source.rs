@@ -33,6 +33,7 @@ pub enum Source {
     Object(ObjectSource),
     FhirServer(FhirServerSource),
     Database(DatabaseSource),
+    Mllp(MllpSource),
 }
 
 impl Source {
@@ -86,6 +87,17 @@ impl Source {
                     .with_signer(store),
                 )
             }
+            SourceConfig::Mllp { listen, spool, .. } => Source::Mllp(MllpSource {
+                feed_id: feed.id.clone(),
+                listen: listen.clone(),
+                folder: FolderSource {
+                    dir: spool.clone(),
+                    pattern: "*.hl7".into(),
+                    min_age: Duration::ZERO,
+                    archive: spool.join("processed"),
+                },
+                started: std::sync::Mutex::new(false),
+            }),
             SourceConfig::Database {
                 url_env,
                 query,
@@ -121,6 +133,29 @@ impl Source {
         })
     }
 
+    /// Starts whatever listens: the MLLP port. Other sources have nothing to
+    /// start. Safe to call again; a port that cannot be bound is reported and
+    /// tried again on the next call.
+    pub async fn start(&self) -> Result<()> {
+        let Source::Mllp(m) = self else {
+            return Ok(());
+        };
+        if *m.started.lock().expect("mllp mutex") {
+            return Ok(());
+        }
+        let listener = tokio::net::TcpListener::bind(&m.listen)
+            .await
+            .with_context(|| format!("cannot listen for MLLP on {}", m.listen))?;
+        tracing::info!(feed = %m.feed_id, listen = %m.listen, spool = %m.folder.dir.display(), "listening for MLLP");
+        tokio::spawn(crate::hl7::serve(
+            m.feed_id.clone(),
+            listener,
+            m.folder.dir.clone(),
+        ));
+        *m.started.lock().expect("mllp mutex") = true;
+        Ok(())
+    }
+
     /// Gives a pulling source the store its cursors live in. Sources that take
     /// files need none.
     pub fn with_db(self, db: Arc<Db>) -> Self {
@@ -143,6 +178,7 @@ impl Source {
             Source::Object(o) => o.list().await,
             Source::FhirServer(r) => r.list().await,
             Source::Database(d) => d.list().await,
+            Source::Mllp(m) => m.folder.list(),
         }
     }
 
@@ -152,6 +188,7 @@ impl Source {
             Source::Object(o) => o.fetch(key).await,
             Source::FhirServer(r) => r.fetch(key),
             Source::Database(d) => d.fetch(key),
+            Source::Mllp(m) => m.folder.fetch(key),
         }
     }
 
@@ -162,8 +199,18 @@ impl Source {
             Source::Object(o) => o.acknowledge(key, archived_name).await,
             Source::FhirServer(r) => r.acknowledge(key),
             Source::Database(d) => d.acknowledge(key),
+            Source::Mllp(m) => m.folder.acknowledge(key, archived_name),
         }
     }
+}
+
+/// An MLLP listener whose messages wait in a spool folder: the listener writes
+/// them, the folder source takes them.
+pub struct MllpSource {
+    feed_id: String,
+    listen: String,
+    folder: FolderSource,
+    started: std::sync::Mutex<bool>,
 }
 
 /// A local folder, polled. A file is taken once it has not changed for `min_age`,
@@ -327,7 +374,9 @@ impl Source {
     /// object itself.
     pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         match self {
-            Source::Folder(_) | Source::FhirServer(_) | Source::Database(_) => Ok(None),
+            Source::Folder(_) | Source::FhirServer(_) | Source::Database(_) | Source::Mllp(_) => {
+                Ok(None)
+            }
             Source::Object(o) => match &o.signer {
                 None => Ok(None),
                 Some(signer) => {
@@ -362,6 +411,17 @@ impl Source {
             Source::Object(o) => o.probe().await?,
             Source::FhirServer(r) => return r.probe(started).await,
             Source::Database(d) => return d.probe(started).await,
+            Source::Mllp(m) => {
+                // Can the port be taken? Then what waits in the spool.
+                if !*m.started.lock().expect("mllp mutex") {
+                    drop(
+                        tokio::net::TcpListener::bind(&m.listen)
+                            .await
+                            .with_context(|| format!("cannot listen on {}", m.listen))?,
+                    );
+                }
+                m.folder.probe()?
+            }
         };
         let newest = found.iter().max_by_key(|(_, at)| *at);
         Ok(Probe {

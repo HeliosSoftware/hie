@@ -62,7 +62,37 @@ pub fn read(format: Format, bytes: &[u8]) -> Result<Vec<SourceRecord>> {
         Format::Csv => read_csv(&text),
         Format::Ndjson => Ok(read_ndjson(&text)),
         Format::FhirBundle => read_fhir_bundle(&text),
+        Format::Hl7v2 => Ok(read_hl7v2(&text)),
     }
+}
+
+/// Reads HL7 v2 messages, one record each, with the line their `MSH` is on. A
+/// message that does not parse is kept as a record with the error, so the file's
+/// other messages still go through.
+pub fn read_hl7v2(text: &str) -> Vec<SourceRecord> {
+    let mut out = Vec::new();
+    for (line, message) in crate::hl7::split_messages(text) {
+        out.push(match crate::hl7::parse(&message) {
+            Ok(m) => SourceRecord {
+                line,
+                raw: m.to_json(),
+                parse_error: None,
+            },
+            Err(e) => SourceRecord {
+                line,
+                raw: json!({ "_text": message }),
+                parse_error: Some(format!("{e:#}")),
+            },
+        });
+    }
+    if out.is_empty() && !text.trim().is_empty() {
+        out.push(SourceRecord {
+            line: 1,
+            raw: json!({ "_text": text }),
+            parse_error: Some("no MSH segment: not an HL7 v2 message".into()),
+        });
+    }
+    out
 }
 
 /// Reads a CSV with a header row into one JSON object per data row, keyed by column name.

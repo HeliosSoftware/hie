@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod database;
 pub mod db;
 pub mod fhir;
+pub mod hl7;
 pub mod manager;
 pub mod pipeline;
 pub mod reader;

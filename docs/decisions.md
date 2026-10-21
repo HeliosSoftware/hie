@@ -307,10 +307,23 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Cost / not yet:** SQL Server needs another driver (`tiberius`); the YAML shape stays. Rows that share the cursor's largest value across a `LIMIT` boundary are skipped (use a unique column, or an updated-at with enough precision). Deleted rows are not seen. MySQL decoding is written to the same pattern as PostgreSQL but not yet exercised against a server.
 
+## 27. HL7 v2: messages parsed to JSON for the transform, and an MLLP listener that spools before it acknowledges
+
+**Chosen:** `format: hl7v2` reads a file of messages (one or more, each from its `MSH`; `\r`, `\n` or `\r\n` between segments) into one record per message: a JSON object with the message type, control id, sender and receiver, and every segment as a list of fields, components and repetitions left as text. The Python helpers `hl7(record, "PID-5.1")`, `hl7_segments`, `hl7_field` and `hl7_datetime` in `hie_runtime/hie.py` do the splitting. `source.type: mllp` listens on a TCP address: each framed message is parsed, written to the `spool` folder as its own file (write, fsync, rename), and only then answered `AA`; a message that cannot be stored is answered `AE` and one that is not HL7 at all `AR`. The spool is then taken like a folder source: one load per message, SHA-256 dedupe, the transform, delivery. Format is forced to `hl7v2` and `bulk_submit` refused.
+
+**Why:**
+- An integration engine's first wire is HL7 v2 over MLLP; the lab exercise with Camel and OIE was about exactly this.
+- Acknowledging only after the message is on disk is the one promise a sender relies on: an `AA` means HIE has it, whatever happens next. An `AE` on a full disk makes the sender keep and resend.
+- Spooling to files reuses the folder path unchanged: traceability per message (the file is the message), duplicates recognised by hash, pause and reprocess as for any load. A listener that wrote straight to the records table would need its own copies of those.
+- Fields as text with their separators, plus helpers, rather than a deep nested structure: a transform reads `PID-5.1` the way the HL7 world writes it, and a segment the parser does not know needs no schema.
+- The parser is small and in the engine (segments, fields, the `MSH` separators). An HL7 library would bring a schema for every version and still need the same JSON for Python.
+
+**Cost / not yet:** no TLS on the listener (front it with a TLS proxy or a VPN, as is usual for MLLP); no batch (`BHS`/`BTS`) or `FHS` files; no outbound MLLP (sending ACK-dependent results back); `MSH-9.3` structure codes are not validated; one ACK per message, so a sender that pipelines many frames gets them in order but waits for each disk write.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server and a SQL database: SQL Server, MongoDB.
-- HL7v2 input.
+- HL7 v2 batches (`BHS`/`BTS`), outbound MLLP, TLS on the listener.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
 - Authentication to HFS with a private-key JWT (SMART backend services); client credentials are in.

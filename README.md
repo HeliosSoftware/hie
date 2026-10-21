@@ -123,6 +123,21 @@ A **FHIR server** source (`type: fhir_server`, see `sources/other-fhir.yaml.exam
 
 A **database** source (`type: database`, see `sources/lab-database.yaml.example` and `transforms/sql_lab_results.py`) reads a SQL database with the operator's own query: `url_env` names the environment variable holding the connection URL (`postgres://`, `mysql://` or `sqlite:`; the URL carries the password, so it is never in the file), `query` is the SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`, and `cursor_column` is the column the cursor follows. Prefer a **unique, increasing column** such as an id: with an updated-at column, rows that share one timestamp (a multi-row `INSERT` gets a single `now()`) and fall on both sides of a `LIMIT` are never read, because the next run asks for values strictly past the cursor; the engine logs a warning when a whole run shares one cursor value. Each pass binds the cursor as a parameter, runs the query up to `max_runs` times moving the cursor between runs, and hands the rows on as one NDJSON load; each row reaches the transform as a JSON object with the database's types (numbers, ISO timestamps, JSON). The cursor keeps its kind (integer, float, timestamp, date, text) and moves to the largest value seen once the records are stored. `cursor_start` says where to begin the first time. PostgreSQL is the target; MySQL/MariaDB and SQLite go through the same code (the tests run on SQLite). The connection test connects and runs the query once past the cursor.
 
+### HL7 v2
+
+`format: hl7v2` reads a file of HL7 v2 messages (one or more, each starting at its `MSH`; segments separated by `\r`, `\n` or `\r\n`) into one record per message. The record is a JSON object the transform reads without parsing pipes:
+
+```json
+{"message_type": "ADT^A01", "control_id": "MSG0001", "sending_application": "LAB", "sending_facility": "NORTH",
+ "receiving_application": "HIE", "receiving_facility": "HFS", "version": "2.5.1",
+ "segments": [{"name": "MSH", "fields": ["|", "^~\\&", "LAB", ...]}, {"name": "PID", "fields": ["1", "", "12345^^^NORTH^MR", "", "Doe^Jane^M", ...]}],
+ "text": "MSH|^~\\&|LAB|..."}
+```
+
+Fields keep their separators; the helpers in `hie_runtime/hie.py` split them: `hl7(record, "PID-5.1")` (segment, field, component; `PID-3[2].1` for a repetition, `OBX(3)-5` for the third OBX), `hl7_segments(record, "OBX")`, `hl7_field(segment, "5.1")`, and `hl7_datetime("20261021120000")` for an HL7 timestamp as a FHIR `dateTime`. `transforms/hl7_adt_patient.py` turns an ADT A01/A04/A08/A28/A31 into a `Patient` delivered as a conditional update on the MRN in `PID-3`.
+
+An **MLLP** source (`type: mllp`, see `sources/adt-mllp.yaml.example`) listens on `listen` (e.g. `0.0.0.0:2575`) for MLLP-framed messages. Every message is parsed, written to `spool` as its own file (written, fsynced, renamed), and **only then acknowledged** `AA`, so an acknowledgement means HIE has it. A message that cannot be stored is answered `AE` (the sender keeps and resends it); bytes that are not HL7 are answered `AR` and dropped. The spool is picked up every `poll_seconds` like a folder: one load per message, the same SHA-256 dedupe (a resent message is a duplicate, not a second update), the transform, delivery. The listener starts with the source and is retried, with an alert, when the port cannot be bound. There is no TLS on the listener; put it behind a TLS proxy or a VPN as MLLP usually is. The connection test checks the port can be taken (when the source is not already listening) and counts what waits in the spool.
+
 ### Delivery methods
 
 `delivery.method` picks how a source's records reach HFS:
@@ -267,10 +282,10 @@ docs/           design decisions
 
 ```sh
 cargo test                                 # unit tests and the end-to-end tests
-python -m unittest tests/test_lab_results.py
+python -m unittest tests/test_lab_results.py tests/test_hl7.py
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/database_source.rs` covers the database source on SQLite: runs of the query past a cursor, the cursor moving once the rows are stored, nothing read twice, `cursor_start`, and the connection test. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/database_source.rs` covers the database source on SQLite: runs of the query past a cursor, the cursor moving once the rows are stored, nothing read twice, `cursor_start`, and the connection test. `tests/hl7v2.rs` covers HL7 v2: a file of messages through a folder source, and messages over MLLP spooled, acknowledged, delivered, and resent as duplicates; `tests/test_hl7.py` covers the Python helpers. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
 
 They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.
