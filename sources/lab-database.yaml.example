@@ -1,0 +1,19 @@
+# Lab results read from a SQL database. Copy to lab-database.yaml and fill in.
+id: lab-database
+name: Lab results (database)
+source:
+  type: database
+  url_env: LAB_DB_URL        # postgres://user:pass@host:5432/lab, mysql://..., sqlite:path
+  # {cursor} is bound to the cursor value; ORDER BY the cursor column and LIMIT each run.
+  query: |
+    SELECT id, patient_mrn AS patient, loinc AS code, display, value, unit, taken_at
+    FROM lab_results
+    WHERE id > {cursor}
+    ORDER BY id
+    LIMIT 500
+  cursor_column: id          # a monotonic column: an id, or an updated-at column with ms precision
+  # cursor_start: "0"        # where to begin the first time; everything when unset
+  poll_seconds: 60
+  max_runs: 10               # runs of the query per pass (10 x LIMIT 500 rows)
+transform: transforms/sql_lab_results.py
+expect_every: 24h

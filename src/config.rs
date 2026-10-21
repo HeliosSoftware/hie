@@ -114,6 +114,27 @@ pub enum SourceConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RemoteAuth>,
     },
+    /// A SQL database, read with a query that follows a cursor column: each pass
+    /// binds the cursor where the query says `{cursor}` and takes the rows past it.
+    Database {
+        /// Environment variable holding the connection URL
+        /// (`postgres://user:pass@host/db`, `mysql://...`, `sqlite://path`).
+        url_env: String,
+        /// The query, with `{cursor}` where the cursor value goes and an
+        /// `ORDER BY` on the cursor column; a `LIMIT` bounds each run.
+        query: String,
+        /// The column the cursor follows: its largest value in a run becomes the
+        /// next cursor. A monotonic column (an id, an updated-at with a sequence).
+        cursor_column: String,
+        /// The first cursor value, when the table should not be read from the start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_start: Option<String>,
+        #[serde(default = "default_poll_seconds")]
+        poll_seconds: u64,
+        /// Runs of the query per pass; the rest waits for the next pass.
+        #[serde(default = "default_max_pages")]
+        max_runs: usize,
+    },
 }
 
 /// Credentials for a remote FHIR server. Secrets are named by environment
@@ -256,6 +277,11 @@ impl SourceConfig {
             SourceConfig::FhirServer { url, types, .. } => {
                 format!("{url} ({})", types.join(", "))
             }
+            SourceConfig::Database {
+                url_env,
+                cursor_column,
+                ..
+            } => format!("database ${url_env} by {cursor_column}"),
         }
     }
 
@@ -263,7 +289,8 @@ impl SourceConfig {
         match self {
             SourceConfig::Folder { poll_seconds, .. }
             | SourceConfig::S3 { poll_seconds, .. }
-            | SourceConfig::FhirServer { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+            | SourceConfig::FhirServer { poll_seconds, .. }
+            | SourceConfig::Database { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
         }
     }
 
@@ -292,6 +319,35 @@ impl SourceConfig {
             }
             if *page_size == 0 || *max_pages == 0 {
                 bail!("fhir_server: page_size and max_pages must be at least 1");
+            }
+        }
+        if let SourceConfig::Database {
+            url_env,
+            query,
+            cursor_column,
+            max_runs,
+            ..
+        } = self
+        {
+            if url_env.trim().is_empty() {
+                bail!(
+                    "database: url_env names the environment variable holding the connection URL"
+                );
+            }
+            if !query.contains("{cursor}") {
+                bail!(
+                    "database: the query must use {{cursor}} where the cursor value goes, e.g. WHERE updated_at > {{cursor}}"
+                );
+            }
+            if cursor_column.trim().is_empty()
+                || !cursor_column
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                bail!("database: cursor_column must be a column name");
+            }
+            if *max_runs == 0 {
+                bail!("database: max_runs must be at least 1");
             }
         }
         Ok(())
@@ -329,14 +385,22 @@ impl FeedConfig {
         self.source
             .check()
             .with_context(|| format!("source {}", self.id))?;
-        if matches!(self.source, SourceConfig::FhirServer { .. }) {
-            // What a server answers is resources, one per record, whatever the
-            // file says; and there is no object for $bulk-submit to fetch.
+        if matches!(
+            self.source,
+            SourceConfig::FhirServer { .. } | SourceConfig::Database { .. }
+        ) {
+            // What a server or a query answers is one JSON object per record,
+            // whatever the file says; and there is no object for $bulk-submit to fetch.
             self.format = Format::Ndjson;
             if self.delivery.method == DeliveryMethod::BulkSubmit {
                 bail!(
-                    "source {}: a fhir_server source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
-                    self.id
+                    "source {}: a {} source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
+                    self.id,
+                    if matches!(self.source, SourceConfig::Database { .. }) {
+                        "database"
+                    } else {
+                        "fhir_server"
+                    }
                 );
             }
         }

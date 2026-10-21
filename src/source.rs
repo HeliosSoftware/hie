@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::config::{FeedConfig, RemoteAuth, SourceConfig, glob_match};
 use crate::credentials::{CredentialSettings, Credentials, TokenSource};
+use crate::database::DatabaseSource;
 use crate::db::Db;
 
 /// One object fetched from a source: a file, an S3 object.
@@ -31,6 +32,7 @@ pub enum Source {
     Folder(FolderSource),
     Object(ObjectSource),
     FhirServer(FhirServerSource),
+    Database(DatabaseSource),
 }
 
 impl Source {
@@ -84,6 +86,21 @@ impl Source {
                     .with_signer(store),
                 )
             }
+            SourceConfig::Database {
+                url_env,
+                query,
+                cursor_column,
+                cursor_start,
+                max_runs,
+                ..
+            } => Source::Database(DatabaseSource::new(
+                &feed.id,
+                url_env,
+                query,
+                cursor_column,
+                cursor_start.clone(),
+                *max_runs,
+            )?),
             SourceConfig::FhirServer {
                 url,
                 types,
@@ -112,6 +129,10 @@ impl Source {
                 f.db = Some(db);
                 Source::FhirServer(f)
             }
+            Source::Database(mut d) => {
+                d.db = Some(db);
+                Source::Database(d)
+            }
             other => other,
         }
     }
@@ -121,6 +142,7 @@ impl Source {
             Source::Folder(f) => f.list(),
             Source::Object(o) => o.list().await,
             Source::FhirServer(r) => r.list().await,
+            Source::Database(d) => d.list().await,
         }
     }
 
@@ -129,6 +151,7 @@ impl Source {
             Source::Folder(f) => f.fetch(key),
             Source::Object(o) => o.fetch(key).await,
             Source::FhirServer(r) => r.fetch(key),
+            Source::Database(d) => d.fetch(key),
         }
     }
 
@@ -138,6 +161,7 @@ impl Source {
             Source::Folder(f) => f.acknowledge(key, archived_name),
             Source::Object(o) => o.acknowledge(key, archived_name).await,
             Source::FhirServer(r) => r.acknowledge(key),
+            Source::Database(d) => d.acknowledge(key),
         }
     }
 }
@@ -303,7 +327,7 @@ impl Source {
     /// object itself.
     pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         match self {
-            Source::Folder(_) | Source::FhirServer(_) => Ok(None),
+            Source::Folder(_) | Source::FhirServer(_) | Source::Database(_) => Ok(None),
             Source::Object(o) => match &o.signer {
                 None => Ok(None),
                 Some(signer) => {
@@ -337,6 +361,7 @@ impl Source {
             Source::Folder(f) => f.probe()?,
             Source::Object(o) => o.probe().await?,
             Source::FhirServer(r) => return r.probe(started).await,
+            Source::Database(d) => return d.probe(started).await,
         };
         let newest = found.iter().max_by_key(|(_, at)| *at);
         Ok(Probe {

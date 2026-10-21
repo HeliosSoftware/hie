@@ -7,6 +7,7 @@ pub mod auth;
 pub mod bulk;
 pub mod config;
 pub mod credentials;
+pub mod database;
 pub mod db;
 pub mod fhir;
 pub mod manager;

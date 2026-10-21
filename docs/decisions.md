@@ -295,9 +295,21 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Cost / not yet:** resources with equal `lastUpdated` at a page boundary rely on `_sort` being honoured; a server that ignores `_sort` must be drained in one pass (`max_pages` high enough). Deleted resources are not seen (`_history` would be needed). `since` is the only way to skip old data.
 
+## 26. A SQL database as a source: the operator's query, a bound cursor
+
+**Chosen:** `source.type: database` names the environment variable that holds the connection URL (PostgreSQL first; MySQL/MariaDB and SQLite through the same code), the query, and the cursor column. The query is the operator's own SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`; the engine binds the cursor as a parameter (never spliced), runs the query up to `max_runs` times per pass moving the cursor between runs, and hands the rows on as one NDJSON load. Rows are decoded by column type (numbers as numbers, timestamps as ISO text, JSON as JSON); the cursor keeps the kind it binds as (integer, float, timestamp, date, text). The cursor moves to the largest value seen once the records are stored. The transform receives one row as a JSON object, as it receives a CSV row.
+
+**Why:**
+- The query is what the person who knows the schema would write anyway; a table/column mapping in YAML would be a worse query language. Keeping it opaque to the engine means any join or view works.
+- The cursor is bound, so the one value that comes from data cannot change the query; the SQL itself comes from the source definition, which is already code the operator owns (like a transform).
+- One typed cursor per source covers the two columns people have: a sequence and an updated-at. Moving it after storing, not after reading, means a crash repeats a run instead of losing it; idempotent `PUT`s make the repeat harmless.
+- `sqlx` gives PostgreSQL, MySQL and SQLite with one API, so the test suite runs on SQLite with no server and the same code is what reaches PostgreSQL.
+
+**Cost / not yet:** SQL Server needs another driver (`tiberius`); the YAML shape stays. Rows that share the cursor's largest value across a `LIMIT` boundary are skipped (use a unique column, or an updated-at with enough precision). Deleted rows are not seen. MySQL decoding is written to the same pattern as PostgreSQL but not yet exercised against a server.
+
 ## Not in the prototype
 
-- Connectors besides a folder, S3 and another FHIR server: a database.
+- Connectors besides a folder, S3, another FHIR server and a SQL database: SQL Server, MongoDB.
 - HL7v2 input.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
