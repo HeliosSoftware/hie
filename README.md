@@ -207,7 +207,18 @@ With `HIE_AUTH_ENABLED=true`, every request under `/api` needs a bearer token si
 | `HIE_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Accepted signing algorithms |
 | `HIE_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Seconds between JWKS refreshes |
 
-With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` writes code the engine then runs, so an open API must only be reachable from trusted clients. Scopes are not enforced yet: any valid token from the issuer may do everything.
+What a token may do is decided by its scopes (the `scope`, `scp` or `roles` claim, as HFS reads them):
+
+| Scope | Grants |
+|---|---|
+| `hie/read` | Every `GET`: sources, loads, records, transforms, alerts, rules, monitoring |
+| `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading |
+| `hie/transforms` | `PUT /api/transforms/{name}`: code the engine then runs; and reading |
+| `hie/*` | Everything |
+
+A valid token without the scope a request needs answers `403` with the scope in `required`. A token from the same identity provider that carries only HFS scopes (`system/*.cruds`) is authenticated but may do nothing here.
+
+With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` writes code the engine then runs, so an open API must only be reachable from trusted clients.
 
 ### The engine's identity towards HFS
 

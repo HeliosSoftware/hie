@@ -99,11 +99,46 @@ pub async fn require_bearer(
     };
     match provider.authenticate(&authorization).await {
         Ok(principal) => {
+            let required = required_scope(request.method().as_str(), request.uri().path());
+            if !granted(principal.scopes.raw(), required) {
+                return forbidden(required, principal.scopes.raw());
+            }
             request.extensions_mut().insert(Arc::new(principal));
             next.run(request).await
         }
         Err(e) => unauthorized(&e.to_string()),
     }
+}
+
+/// Reading anything.
+pub const SCOPE_READ: &str = "hie/read";
+/// Changing sources, rules, loads and records: everything that is not code.
+pub const SCOPE_MANAGE: &str = "hie/manage";
+/// Saving a transform: code the engine then runs.
+pub const SCOPE_TRANSFORMS: &str = "hie/transforms";
+/// Everything.
+pub const SCOPE_ALL: &str = "hie/*";
+
+/// The scope a request needs: its method and path decide, so a token that may
+/// read cannot change anything, and one that may change sources cannot write code.
+pub fn required_scope(method: &str, path: &str) -> &'static str {
+    if matches!(method, "GET" | "HEAD" | "OPTIONS") {
+        return SCOPE_READ;
+    }
+    if method == "PUT" && path.starts_with("/api/transforms/") {
+        return SCOPE_TRANSFORMS;
+    }
+    SCOPE_MANAGE
+}
+
+/// Whether a token's scopes cover the required one. `hie/*` covers everything,
+/// and either write scope also reads.
+pub fn granted(scopes: &[String], required: &str) -> bool {
+    scopes.iter().any(|s| {
+        s == SCOPE_ALL
+            || s == required
+            || (required == SCOPE_READ && (s == SCOPE_MANAGE || s == SCOPE_TRANSFORMS))
+    })
 }
 
 fn unauthorized(reason: &str) -> Response {
@@ -113,4 +148,51 @@ fn unauthorized(reason: &str) -> Response {
         Json(json!({"error": reason})),
     )
         .into_response()
+}
+
+fn forbidden(required: &str, held: &[String]) -> Response {
+    let hie: Vec<&String> = held.iter().filter(|s| s.starts_with("hie/")).collect();
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": format!("this needs the {required} scope; the token has {}",
+                if hie.is_empty() { "no hie/ scope".to_string() } else { format!("{hie:?}") }),
+            "required": required,
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(list: &[&str]) -> Vec<String> {
+        list.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn the_method_and_path_pick_the_scope() {
+        assert_eq!(required_scope("GET", "/api/sources"), SCOPE_READ);
+        assert_eq!(required_scope("POST", "/api/sources"), SCOPE_MANAGE);
+        assert_eq!(required_scope("DELETE", "/api/alert-rules/3"), SCOPE_MANAGE);
+        assert_eq!(
+            required_scope("POST", "/api/transforms/x/try"),
+            SCOPE_MANAGE
+        );
+        assert_eq!(required_scope("GET", "/api/transforms/x"), SCOPE_READ);
+        assert_eq!(required_scope("PUT", "/api/transforms/x"), SCOPE_TRANSFORMS);
+    }
+
+    #[test]
+    fn write_scopes_read_and_the_wildcard_does_everything() {
+        assert!(granted(&s(&["openid", "hie/read"]), SCOPE_READ));
+        assert!(!granted(&s(&["hie/read"]), SCOPE_MANAGE));
+        assert!(granted(&s(&["hie/manage"]), SCOPE_READ));
+        assert!(!granted(&s(&["hie/manage"]), SCOPE_TRANSFORMS));
+        assert!(granted(&s(&["hie/transforms"]), SCOPE_READ));
+        assert!(granted(&s(&["hie/*"]), SCOPE_TRANSFORMS));
+        assert!(!granted(&s(&["system/*.cruds"]), SCOPE_READ));
+        assert!(!granted(&[], SCOPE_READ));
+    }
 }

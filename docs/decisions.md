@@ -232,7 +232,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - The same crate and the same claims as HFS mean one identity provider, one token, and the same `HFS_AUTH_*`-shaped settings an operator already knows.
 - The subject of the token is what the UI's "paused by" needs, so it is recorded.
 
-**Not yet:** scopes and roles (any valid token from the issuer may do everything); per-user audit of changes. The engine's own credentials for calling HFS are decision 23.
+**Not yet:** per-user audit of changes. Scopes are decision 24. The engine's own credentials for calling HFS are decision 23.
 
 ## 21. `$bulk-submit` points HFS at the source objects, and receipts map by `Type/id`
 
@@ -270,6 +270,18 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - A refused token must not reject the data. It is the same situation as HFS being down: wait, retry, and tell someone.
 
 **Not yet:** private-key JWT instead of a shared secret; a token per tenant when one engine serves several; scopes narrowed per source.
+
+## 24. Three scopes on the API: read, manage, transforms
+
+**Chosen:** With auth on, a request needs a scope decided by its method and path: `hie/read` for every `GET`; `hie/transforms` for `PUT /api/transforms/{name}`; `hie/manage` for every other write. The write scopes also read; `hie/*` grants everything. Scopes are read from the `scope`, `scp` or `roles` claim through `helios-auth`, so Keycloak client scopes, Okta scopes and Entra ID app roles all work. A token without the needed scope answers `403` naming it.
+
+**Why:**
+- The monitoring brief has people who only watch; they should not hold a token that can rewrite a source.
+- Saving a transform is running code on the engine. It is the one action worth its own scope, so an operator who manages sources and alert rules cannot ship code, and a developer who writes transforms cannot pause a feed.
+- Three names rather than a SMART `hie/Source.cruds` grammar: the API is not FHIR resources, and the brief's roles map onto three verbs.
+- A token that carries only HFS scopes is refused here on purpose: the engine and HFS are different universes, even when one identity provider serves both.
+
+**Not yet:** per-source grants (a token for one source only); a `user/` context tied to who created the source; audit of who changed what.
 
 ## Not in the prototype
 

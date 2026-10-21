@@ -68,11 +68,15 @@ fn token(claims: Value) -> String {
 }
 
 fn claims(subject: &str, issuer: &str, expires_in: i64) -> Value {
+    scoped(subject, issuer, expires_in, "openid hie/*")
+}
+
+fn scoped(subject: &str, issuer: &str, expires_in: i64, scope: &str) -> Value {
     let now = chrono::Utc::now().timestamp();
     json!({
         "iss": issuer, "aud": "hie", "sub": subject,
         "iat": now, "exp": now + expires_in,
-        "scope": "system/*.cruds",
+        "scope": scope,
     })
 }
 
@@ -202,6 +206,119 @@ async fn the_api_requires_a_valid_bearer_token_when_auth_is_on() {
             .unwrap()
             .status(),
         401
+    );
+}
+
+#[tokio::test]
+async fn scopes_decide_what_a_token_may_do() {
+    let jwks_url = jwks_server().await;
+    let settings = hie::auth::AuthSettings {
+        enabled: true,
+        jwks_url: Some(jwks_url),
+        issuer: Some(ISSUER.into()),
+        audience: Some("hie".into()),
+        algorithms: vec!["RS256".into()],
+        jwks_min_refresh_interval: 0,
+    };
+    let auth = hie::auth::build(&settings).await.unwrap();
+    let (api, _dir) = engine(auth).await;
+    let http = reqwest::Client::new();
+    let mint = |scope: &str| token(scoped("sam", ISSUER, 600, scope));
+    let source = json!({"id": "exports", "name": "Exports",
+        "source": {"type": "folder", "path": "inbox", "poll_seconds": 3600},
+        "format": "ndjson", "transform": "transforms/fhir_passthrough.py"});
+
+    // A valid token from the issuer with no hie/ scope is authenticated but may do nothing.
+    let hfs_only = mint("system/*.cruds");
+    let r = http
+        .get(format!("{api}/api/sources"))
+        .bearer_auth(&hfs_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["required"], "hie/read");
+    assert!(
+        body["error"].as_str().unwrap().contains("no hie/ scope"),
+        "{body}"
+    );
+
+    // Read: lists, but cannot change.
+    let reader = mint("openid hie/read");
+    assert_eq!(
+        http.get(format!("{api}/api/sources"))
+            .bearer_auth(&reader)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let r = http
+        .post(format!("{api}/api/sources"))
+        .bearer_auth(&reader)
+        .json(&source)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(r.json::<Value>().await.unwrap()["required"], "hie/manage");
+
+    // Manage: sources and rules, but no code.
+    let manager = mint("hie/manage");
+    assert_eq!(
+        http.post(format!("{api}/api/sources"))
+            .bearer_auth(&manager)
+            .json(&source)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    assert_eq!(
+        http.get(format!("{api}/api/transforms"))
+            .bearer_auth(&manager)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let r = http
+        .put(format!("{api}/api/transforms/new_one"))
+        .bearer_auth(&manager)
+        .json(&json!({"code": "def transform(record):\n    return []\n"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["required"],
+        "hie/transforms"
+    );
+
+    // Transforms: code, and reading, but not sources.
+    let developer = mint("hie/transforms");
+    assert_eq!(
+        http.put(format!("{api}/api/transforms/new_one"))
+            .bearer_auth(&developer)
+            .json(&json!({"code": "def transform(record):\n    return []\n"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    assert_eq!(
+        http.post(format!("{api}/api/sources/exports/pause"))
+            .bearer_auth(&developer)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
     );
 }
 
