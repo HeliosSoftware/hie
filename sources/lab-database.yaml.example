@@ -3,7 +3,7 @@ id: lab-database
 name: Lab results (database)
 source:
   type: database
-  url_env: LAB_DB_URL        # postgres://user:pass@host:5432/lab, mysql://..., sqlite:path
+  url_env: LAB_DB_URL        # postgres://user:pass@host:5432/lab, mysql://..., sqlserver://user:pass@host:1433/lab?trust_cert=true, sqlite:path
   # {cursor} is bound to the cursor value; ORDER BY the cursor column and LIMIT each run.
   query: |
     SELECT id, patient_mrn AS patient, loinc AS code, display, value, unit, taken_at

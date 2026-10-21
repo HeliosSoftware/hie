@@ -39,6 +39,76 @@ enum Pool {
     Postgres(PgPool),
     MySql(MySqlPool),
     Sqlite(SqlitePool),
+    /// SQL Server opens a connection per run; tiberius has no pool.
+    MsSql(Box<tiberius::Config>),
+}
+
+/// `sqlserver://user:password@host:1433/database?encrypt=on&trust_cert=true`
+/// (`mssql://` too) as a tiberius configuration. `encrypt` is `on` by default;
+/// `trust_cert=true` accepts a self-signed certificate, as a lab server has.
+fn mssql_config(url: &str) -> Result<tiberius::Config> {
+    let parsed = url::Url::parse(url).context("parsing the SQL Server URL")?;
+    let mut config = tiberius::Config::new();
+    config.host(
+        parsed
+            .host_str()
+            .context("the SQL Server URL has no host")?,
+    );
+    config.port(parsed.port().unwrap_or(1433));
+    let database = parsed.path().trim_start_matches('/');
+    if !database.is_empty() {
+        config.database(database);
+    }
+    let user = parsed.username();
+    if user.is_empty() {
+        bail!("the SQL Server URL needs user:password (Windows authentication is not supported)");
+    }
+    let password = parsed.password().unwrap_or_default();
+    config.authentication(tiberius::AuthMethod::sql_server(
+        percent_decode(user),
+        percent_decode(password),
+    ));
+    let mut encrypt = true;
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "encrypt" => encrypt = !matches!(value.as_ref(), "off" | "false" | "no" | "0"),
+            "trust_cert" | "trustServerCertificate" => {
+                if matches!(value.as_ref(), "true" | "yes" | "1") {
+                    config.trust_cert();
+                }
+            }
+            "application" => config.application_name(value.as_ref()),
+            other => bail!(
+                "unknown SQL Server URL option {other:?} (use encrypt, trust_cert, application)"
+            ),
+        }
+    }
+    config.encryption(if encrypt {
+        tiberius::EncryptionLevel::Required
+    } else {
+        tiberius::EncryptionLevel::NotSupported
+    });
+    Ok(config)
+}
+
+fn percent_decode(text: &str) -> String {
+    url::form_urlencoded::parse(text.as_bytes())
+        .map(|(k, v)| format!("{k}{v}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+async fn mssql_connect(
+    config: &tiberius::Config,
+) -> Result<tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>> {
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    let tcp = tokio::net::TcpStream::connect(config.get_addr())
+        .await
+        .with_context(|| format!("cannot reach SQL Server at {}", config.get_addr()))?;
+    tcp.set_nodelay(true)?;
+    tiberius::Client::connect(config.clone(), tcp.compat_write())
+        .await
+        .context("connecting to SQL Server")
 }
 
 struct Pulled {
@@ -146,9 +216,14 @@ impl DatabaseSource {
         if !(url.starts_with("postgres://")
             || url.starts_with("postgresql://")
             || url.starts_with("mysql://")
-            || url.starts_with("sqlite:"))
+            || url.starts_with("sqlite:")
+            || url.starts_with("sqlserver://")
+            || url.starts_with("mssql://"))
         {
-            bail!("{url_env} must be a postgres://, mysql:// or sqlite: URL");
+            bail!("{url_env} must be a postgres://, mysql://, sqlserver:// or sqlite: URL");
+        }
+        if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+            mssql_config(&url)?;
         }
         Ok(Self {
             feed_id: feed_id.to_string(),
@@ -167,31 +242,37 @@ impl DatabaseSource {
         self.pool
             .get_or_try_init(|| async {
                 let timeout = Duration::from_secs(30);
-                let pool = if self.url.starts_with("mysql://") {
-                    Pool::MySql(
-                        MySqlPoolOptions::new()
-                            .max_connections(2)
-                            .acquire_timeout(timeout)
-                            .connect(&self.url)
-                            .await?,
-                    )
-                } else if self.url.starts_with("sqlite:") {
-                    Pool::Sqlite(
-                        SqlitePoolOptions::new()
-                            .max_connections(1)
-                            .acquire_timeout(timeout)
-                            .connect(&self.url)
-                            .await?,
-                    )
-                } else {
-                    Pool::Postgres(
-                        PgPoolOptions::new()
-                            .max_connections(2)
-                            .acquire_timeout(timeout)
-                            .connect(&self.url)
-                            .await?,
-                    )
-                };
+                let pool =
+                    if self.url.starts_with("sqlserver://") || self.url.starts_with("mssql://") {
+                        let config = mssql_config(&self.url)?;
+                        // Connect once now, so a wrong host or password shows at start.
+                        mssql_connect(&config).await?;
+                        Pool::MsSql(Box::new(config))
+                    } else if self.url.starts_with("mysql://") {
+                        Pool::MySql(
+                            MySqlPoolOptions::new()
+                                .max_connections(2)
+                                .acquire_timeout(timeout)
+                                .connect(&self.url)
+                                .await?,
+                        )
+                    } else if self.url.starts_with("sqlite:") {
+                        Pool::Sqlite(
+                            SqlitePoolOptions::new()
+                                .max_connections(1)
+                                .acquire_timeout(timeout)
+                                .connect(&self.url)
+                                .await?,
+                        )
+                    } else {
+                        Pool::Postgres(
+                            PgPoolOptions::new()
+                                .max_connections(2)
+                                .acquire_timeout(timeout)
+                                .connect(&self.url)
+                                .await?,
+                        )
+                    };
                 Ok::<_, anyhow::Error>(pool)
             })
             .await
@@ -217,6 +298,7 @@ impl DatabaseSource {
             Pool::Postgres(_) => (self.query.replace("{cursor}", "$1"), 1),
             Pool::Sqlite(_) => (self.query.replace("{cursor}", "?1"), 1),
             Pool::MySql(_) => (self.query.replace("{cursor}", "?"), occurrences),
+            Pool::MsSql(_) => (self.query.replace("{cursor}", "@P1"), 1),
         }
     }
 
@@ -276,6 +358,34 @@ impl DatabaseSource {
                     .with_context(|| query_failed(&sql, first))?
                     .iter()
                     .map(mysql_row)
+                    .collect()
+            }
+            Pool::MsSql(config) => {
+                let mut client = mssql_connect(config).await?;
+                let param: Box<dyn tiberius::ToSql> = match &cursor {
+                    Cursor::Int(i) => Box::new(*i),
+                    Cursor::Float(f) => Box::new(*f),
+                    Cursor::Timestamp(t) => match instant(t) {
+                        Some(at) => Box::new(at.naive_utc()),
+                        None => Box::new(t.clone()),
+                    },
+                    Cursor::Date(d) => match NaiveDate::parse_from_str(d, "%Y-%m-%d") {
+                        Ok(d) => Box::new(d),
+                        Err(_) => Box::new(d.clone()),
+                    },
+                    Cursor::Text(s) => Box::new(s.clone()),
+                };
+                let params: Vec<&dyn tiberius::ToSql> =
+                    (0..binds).map(|_| param.as_ref()).collect();
+                client
+                    .query(sql.as_str(), &params)
+                    .await
+                    .with_context(|| query_failed(&sql, first))?
+                    .into_first_result()
+                    .await
+                    .with_context(|| query_failed(&sql, first))?
+                    .iter()
+                    .map(mssql_row)
                     .collect()
             }
             Pool::Sqlite(p) => {
@@ -527,6 +637,116 @@ fn mysql_row(row: &MySqlRow) -> Map<String, Value> {
                     kind = name,
                     "column type not decoded; null"
                 );
+                Value::Null
+            }),
+        );
+    }
+    out
+}
+
+fn mssql_row(row: &tiberius::Row) -> Map<String, Value> {
+    use tiberius::ColumnType as T;
+    let mut out = Map::new();
+    for (i, column) in row.columns().iter().enumerate() {
+        let kind = column.column_type();
+        let value: Option<Value> = match kind {
+            T::Null => Some(Value::Null),
+            T::Bit | T::Bitn => row
+                .try_get::<bool, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, Value::Bool)),
+            T::Int1 => row
+                .try_get::<u8, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64))),
+            T::Int2 => row
+                .try_get::<i16, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64))),
+            T::Int4 => row
+                .try_get::<i32, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64))),
+            T::Int8 => row
+                .try_get::<i64, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, Value::from)),
+            T::Intn => row
+                .try_get::<i64, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, Value::from))
+                .or_else(|| {
+                    row.try_get::<i32, _>(i)
+                        .ok()
+                        .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64)))
+                })
+                .or_else(|| {
+                    row.try_get::<i16, _>(i)
+                        .ok()
+                        .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64)))
+                })
+                .or_else(|| {
+                    row.try_get::<u8, _>(i)
+                        .ok()
+                        .map(|v| v.map_or(Value::Null, |n| Value::from(n as i64)))
+                }),
+            T::Float4 => row
+                .try_get::<f32, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |n| Value::from(n as f64))),
+            T::Float8 => row
+                .try_get::<f64, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, Value::from)),
+            T::Floatn => row
+                .try_get::<f64, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, Value::from))
+                .or_else(|| {
+                    row.try_get::<f32, _>(i)
+                        .ok()
+                        .map(|v| v.map_or(Value::Null, |n| Value::from(n as f64)))
+                }),
+            T::Decimaln | T::Numericn | T::Money | T::Money4 => row
+                .try_get::<tiberius::numeric::Decimal, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |d| number(&d.to_string()))),
+            T::Guid => row
+                .try_get::<tiberius::Uuid, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |u| Value::String(u.to_string()))),
+            T::Daten => row
+                .try_get::<NaiveDate, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |d| Value::String(d.to_string()))),
+            T::Timen => row
+                .try_get::<chrono::NaiveTime, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |t| Value::String(t.to_string()))),
+            T::Datetime | T::Datetime4 | T::Datetimen | T::Datetime2 => {
+                row.try_get::<NaiveDateTime, _>(i).ok().map(|v| {
+                    v.map_or(Value::Null, |t| {
+                        Value::String(t.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                    })
+                })
+            }
+            T::DatetimeOffsetn => row
+                .try_get::<DateTime<Utc>, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |t| Value::String(t.to_rfc3339()))),
+            T::BigVarBin | T::BigBinary | T::Image => row
+                .try_get::<&[u8], _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |b| Value::String(hex::encode(b)))),
+            _ => row
+                .try_get::<&str, _>(i)
+                .ok()
+                .map(|v| v.map_or(Value::Null, |s| Value::String(s.to_string()))),
+        };
+        out.insert(
+            column.name().to_string(),
+            value.unwrap_or_else(|| {
+                tracing::warn!(column = column.name(), kind = ?kind, "column type not decoded; null");
                 Value::Null
             }),
         );

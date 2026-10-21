@@ -297,7 +297,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 26. A SQL database as a source: the operator's query, a bound cursor
 
-**Chosen:** `source.type: database` names the environment variable that holds the connection URL (PostgreSQL first; MySQL/MariaDB and SQLite through the same code), the query, and the cursor column. The query is the operator's own SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`; the engine binds the cursor as a parameter (never spliced), runs the query up to `max_runs` times per pass moving the cursor between runs, and hands the rows on as one NDJSON load. Rows are decoded by column type (numbers as numbers, timestamps as ISO text, JSON as JSON); the cursor keeps the kind it binds as (integer, float, timestamp, date, text). The cursor moves to the largest value seen once the records are stored. The transform receives one row as a JSON object, as it receives a CSV row.
+**Chosen:** `source.type: database` names the environment variable that holds the connection URL (PostgreSQL first; MySQL/MariaDB and SQLite through the same code; SQL Server through its own driver), the query, and the cursor column. The query is the operator's own SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`; the engine binds the cursor as a parameter (never spliced), runs the query up to `max_runs` times per pass moving the cursor between runs, and hands the rows on as one NDJSON load. Rows are decoded by column type (numbers as numbers, timestamps as ISO text, JSON as JSON); the cursor keeps the kind it binds as (integer, float, timestamp, date, text). The cursor moves to the largest value seen once the records are stored. The transform receives one row as a JSON object, as it receives a CSV row.
 
 **Why:**
 - The query is what the person who knows the schema would write anyway; a table/column mapping in YAML would be a worse query language. Keeping it opaque to the engine means any join or view works.
@@ -305,7 +305,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - One typed cursor per source covers the two columns people have: a sequence and an updated-at. Moving it after storing, not after reading, means a crash repeats a run instead of losing it; idempotent `PUT`s make the repeat harmless.
 - `sqlx` gives PostgreSQL, MySQL and SQLite with one API, so the test suite runs on SQLite with no server and the same code is what reaches PostgreSQL.
 
-**Cost / not yet:** SQL Server needs another driver (`tiberius`); the YAML shape stays. Rows that share the cursor's largest value across a `LIMIT` boundary are skipped (use a unique column, or an updated-at with enough precision). Deleted rows are not seen. MySQL decoding is written to the same pattern as PostgreSQL but not yet exercised against a server.
+**Cost / not yet:** SQL Server comes through a second driver (`tiberius`) behind the same definition; its placeholder is `@P1` and `TOP n` stands in for `LIMIT`, and only SQL Server authentication is supported. Rows that share the cursor's largest value across a `LIMIT` boundary are skipped (use a unique column, or an updated-at with enough precision). Deleted rows are not seen. MySQL decoding is written to the same pattern as PostgreSQL but not yet exercised against a server.
 
 ## 27. HL7 v2: messages parsed to JSON for the transform, and an MLLP listener that spools before it acknowledges
 
@@ -322,7 +322,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## Not in the prototype
 
-- Connectors besides a folder, S3, another FHIR server and a SQL database: SQL Server, MongoDB.
+- Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.
 - HL7 v2 batches (`BHS`/`BTS`), outbound MLLP, TLS on the listener.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
