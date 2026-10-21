@@ -93,6 +93,52 @@ pub enum SourceConfig {
         #[serde(default = "default_archive_prefix")]
         archive_prefix: String,
     },
+    /// Another FHIR server, pulled by `_lastUpdated`: each pass takes what changed
+    /// since the last one, per resource type, and hands it on as NDJSON.
+    FhirServer {
+        url: String,
+        /// Resource types to pull, each with its own cursor.
+        types: Vec<String>,
+        #[serde(default = "default_poll_seconds")]
+        poll_seconds: u64,
+        /// `_count` per page.
+        #[serde(default = "default_page_size")]
+        page_size: usize,
+        /// Pages per type per pass; the rest waits for the next pass.
+        #[serde(default = "default_max_pages")]
+        max_pages: usize,
+        /// Where to start the first time, as a FHIR instant; everything when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        /// How to authenticate to that server; anonymous when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RemoteAuth>,
+    },
+}
+
+/// Credentials for a remote FHIR server. Secrets are named by environment
+/// variable, never written in the source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum RemoteAuth {
+    /// An OAuth2 client-credentials grant at the server's identity provider.
+    ClientCredentials {
+        token_url: String,
+        client_id: String,
+        client_secret_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
+    /// A fixed bearer token.
+    Bearer { token_env: String },
+}
+
+fn default_page_size() -> usize {
+    200
+}
+
+fn default_max_pages() -> usize {
+    20
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,15 +253,48 @@ impl SourceConfig {
         match self {
             SourceConfig::Folder { path, .. } => path.display().to_string(),
             SourceConfig::S3 { bucket, prefix, .. } => format!("s3://{bucket}/{prefix}"),
+            SourceConfig::FhirServer { url, types, .. } => {
+                format!("{url} ({})", types.join(", "))
+            }
         }
     }
 
     pub fn poll_interval(&self) -> Duration {
         match self {
-            SourceConfig::Folder { poll_seconds, .. } | SourceConfig::S3 { poll_seconds, .. } => {
-                Duration::from_secs(*poll_seconds)
+            SourceConfig::Folder { poll_seconds, .. }
+            | SourceConfig::S3 { poll_seconds, .. }
+            | SourceConfig::FhirServer { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+        }
+    }
+
+    /// Checks what the type itself cannot: a FHIR server source needs at least one
+    /// resource type, sane paging, and a URL that looks like one.
+    pub fn check(&self) -> Result<()> {
+        if let SourceConfig::FhirServer {
+            url,
+            types,
+            page_size,
+            max_pages,
+            ..
+        } = self
+        {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                bail!("fhir_server url must start with http:// or https://");
+            }
+            if types.is_empty() {
+                bail!("fhir_server needs at least one resource type in types");
+            }
+            if let Some(bad) = types
+                .iter()
+                .find(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_alphanumeric()))
+            {
+                bail!("fhir_server: {bad:?} is not a resource type");
+            }
+            if *page_size == 0 || *max_pages == 0 {
+                bail!("fhir_server: page_size and max_pages must be at least 1");
             }
         }
+        Ok(())
     }
 
     /// Makes a folder's paths absolute against the directory holding `hie.yaml`.
@@ -247,6 +326,20 @@ impl FeedConfig {
             bail!("source {}: name is required", self.id);
         }
         self.source.resolve(base);
+        self.source
+            .check()
+            .with_context(|| format!("source {}", self.id))?;
+        if matches!(self.source, SourceConfig::FhirServer { .. }) {
+            // What a server answers is resources, one per record, whatever the
+            // file says; and there is no object for $bulk-submit to fetch.
+            self.format = Format::Ndjson;
+            if self.delivery.method == DeliveryMethod::BulkSubmit {
+                bail!(
+                    "source {}: a fhir_server source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
+                    self.id
+                );
+            }
+        }
         self.transform = base.join(&self.transform);
         if !self.transform.is_file() {
             bail!(

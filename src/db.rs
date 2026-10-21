@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS source_state (
   paused_at INTEGER,
   paused_by TEXT
 );
+CREATE TABLE IF NOT EXISTS source_cursors (
+  feed_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  cursor TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (feed_id, key)
+);
 CREATE TABLE IF NOT EXISTS submissions (
   token TEXT PRIMARY KEY,
   feed_id TEXT NOT NULL,
@@ -713,6 +720,37 @@ impl Db {
 
     pub fn is_paused(&self, feed: &str) -> Result<bool> {
         Ok(self.paused_state(feed)?.is_some())
+    }
+
+    /// Where a pulling source left off, per key (a resource type for a FHIR server).
+    pub fn cursor(&self, feed: &str, key: &str) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT cursor FROM source_cursors WHERE feed_id = ?1 AND key = ?2",
+                params![feed, key],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
+
+    pub fn set_cursor(&self, feed: &str, key: &str, cursor: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO source_cursors (feed_id, key, cursor, updated_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(feed_id, key) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+                params![feed, key, cursor, now_ms()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn cursors(&self, feed: &str) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            c.prepare("SELECT key, cursor FROM source_cursors WHERE feed_id = ?1 ORDER BY key")?
+                .query_map(params![feed], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        })
     }
 
     pub fn last_received_at(&self, feed: &str) -> Result<Option<i64>> {

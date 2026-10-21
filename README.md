@@ -119,6 +119,8 @@ expect_every: 24h            # the silence rule the source is born with
 
 An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO.
 
+A **FHIR server** source (`type: fhir_server`, see `sources/other-fhir.yaml.example`) pulls another server into HFS: it names the server's `url`, the resource `types` to pull, and optionally `since` (a FHIR instant to start from) and `auth` (`method: client_credentials` with `token_url`, `client_id`, `client_secret_env`, or `method: bearer` with `token_env`; secrets are read from the named environment variable, never written in the file). Each pass searches every type for `_lastUpdated=gt{cursor}` sorted by `_lastUpdated`, `page_size` per page and up to `max_pages` pages, and hands the resources on as one NDJSON load per type; the cursor moves to the newest `meta.lastUpdated` once the records are stored, so a crash repeats a page rather than losing it. The format is `ndjson` whatever the file says, resources go out by their id, and `bulk_submit` is refused. The connection test reads `/metadata` and counts what waits past each cursor.
+
 ### Delivery methods
 
 `delivery.method` picks how a source's records reach HFS:
@@ -267,6 +269,6 @@ python -m unittest tests/test_lab_results.py
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
 
 They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.

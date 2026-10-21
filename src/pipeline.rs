@@ -53,7 +53,7 @@ impl FeedRunner {
         fhir_base_url: &str,
         public_url: &str,
     ) -> Result<Self> {
-        let source = Source::from_config(&feed)?;
+        let source = Source::from_config(&feed)?.with_db(db.clone());
         Ok(Self::with_source(
             feed,
             source,

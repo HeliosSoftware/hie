@@ -283,9 +283,21 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Not yet:** per-source grants (a token for one source only); a `user/` context tied to who created the source; audit of who changed what.
 
+## 25. A FHIR server as a source: pulled by `_lastUpdated`, one cursor per type
+
+**Chosen:** `source.type: fhir_server` names a server, the resource types to pull, and how to authenticate (a client-credentials grant or a fixed bearer token, the secret always read from an environment variable the file names). Each pass searches every type for `_lastUpdated=gt{cursor}`, sorted by `_lastUpdated`, page by page up to `max_pages`, and hands the resources on as one NDJSON load per type. The cursor is the newest `meta.lastUpdated` seen and moves only after the engine has stored the records. The load's format is forced to `ndjson`, resources are delivered by their id, and `$bulk-submit` is refused for this source. The connection test reads `/metadata` and counts what waits past each cursor.
+
+**Why:**
+- Migrating from or mirroring another FHIR server is a connector customers ask for first, and it needs nothing new on the wire: search and paging that every server has.
+- `_lastUpdated` with a cursor is the one incremental mechanism that works on any server; `_history` and Subscriptions are not everywhere, and `$export` is a different pipeline (decision 21).
+- Moving the cursor after storing, not after fetching, means a crash repeats a page instead of losing it; idempotent `PUT`s make the repeat harmless.
+- One cursor per type rather than one for the server, because servers page each type independently and a slow type should not hold back the others.
+
+**Cost / not yet:** resources with equal `lastUpdated` at a page boundary rely on `_sort` being honoured; a server that ignores `_sort` must be drained in one pass (`max_pages` high enough). Deleted resources are not seen (`_history` would be needed). `since` is the only way to skip old data.
+
 ## Not in the prototype
 
-- Connectors besides a folder and S3: database, another FHIR server.
+- Connectors besides a folder, S3 and another FHIR server: a database.
 - HL7v2 input.
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).

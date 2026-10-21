@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -11,7 +12,9 @@ use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
 use serde::Serialize;
 
-use crate::config::{FeedConfig, SourceConfig, glob_match};
+use crate::config::{FeedConfig, RemoteAuth, SourceConfig, glob_match};
+use crate::credentials::{CredentialSettings, Credentials, TokenSource};
+use crate::db::Db;
 
 /// One object fetched from a source: a file, an S3 object.
 pub struct Incoming {
@@ -27,6 +30,7 @@ pub struct Incoming {
 pub enum Source {
     Folder(FolderSource),
     Object(ObjectSource),
+    FhirServer(FhirServerSource),
 }
 
 impl Source {
@@ -80,13 +84,43 @@ impl Source {
                     .with_signer(store),
                 )
             }
+            SourceConfig::FhirServer {
+                url,
+                types,
+                page_size,
+                max_pages,
+                since,
+                auth,
+                ..
+            } => Source::FhirServer(FhirServerSource::new(
+                &feed.id,
+                url,
+                types,
+                *page_size,
+                *max_pages,
+                since.clone(),
+                auth.as_ref(),
+            )?),
         })
+    }
+
+    /// Gives a pulling source the store its cursors live in. Sources that take
+    /// files need none.
+    pub fn with_db(self, db: Arc<Db>) -> Self {
+        match self {
+            Source::FhirServer(mut f) => {
+                f.db = Some(db);
+                Source::FhirServer(f)
+            }
+            other => other,
+        }
     }
 
     pub async fn list(&self) -> Result<Vec<String>> {
         match self {
             Source::Folder(f) => f.list(),
             Source::Object(o) => o.list().await,
+            Source::FhirServer(r) => r.list().await,
         }
     }
 
@@ -94,6 +128,7 @@ impl Source {
         match self {
             Source::Folder(f) => f.fetch(key),
             Source::Object(o) => o.fetch(key).await,
+            Source::FhirServer(r) => r.fetch(key),
         }
     }
 
@@ -102,6 +137,7 @@ impl Source {
         match self {
             Source::Folder(f) => f.acknowledge(key, archived_name),
             Source::Object(o) => o.acknowledge(key, archived_name).await,
+            Source::FhirServer(r) => r.acknowledge(key),
         }
     }
 }
@@ -267,7 +303,7 @@ impl Source {
     /// object itself.
     pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         match self {
-            Source::Folder(_) => Ok(None),
+            Source::Folder(_) | Source::FhirServer(_) => Ok(None),
             Source::Object(o) => match &o.signer {
                 None => Ok(None),
                 Some(signer) => {
@@ -300,6 +336,7 @@ impl Source {
         let found = match self {
             Source::Folder(f) => f.probe()?,
             Source::Object(o) => o.probe().await?,
+            Source::FhirServer(r) => return r.probe(started).await,
         };
         let newest = found.iter().max_by_key(|(_, at)| *at);
         Ok(Probe {
@@ -355,6 +392,266 @@ impl ObjectSource {
             found.push((key, meta.last_modified));
         }
         Ok(found)
+    }
+}
+
+/// Another FHIR server, pulled by `_lastUpdated`. Each resource type is a key: a
+/// pass searches it for what changed after the type's cursor, in pages sorted by
+/// `_lastUpdated`, and hands the resources on as one NDJSON "file". The cursor
+/// moves to the newest `meta.lastUpdated` seen once the engine has stored the
+/// records, so a crash in between pulls the same resources again (idempotent
+/// `PUT`s) rather than skipping any.
+pub struct FhirServerSource {
+    feed_id: String,
+    base: String,
+    types: Vec<String>,
+    page_size: usize,
+    max_pages: usize,
+    since: Option<String>,
+    http: reqwest::Client,
+    credentials: Credentials,
+    bearer: Option<String>,
+    pub(crate) db: Option<Arc<Db>>,
+    /// What `list` pulled, waiting for `fetch` and `acknowledge`.
+    pulled: std::sync::Mutex<HashMap<String, Pulled>>,
+}
+
+struct Pulled {
+    bytes: Vec<u8>,
+    count: usize,
+    newest: String,
+}
+
+impl FhirServerSource {
+    pub fn new(
+        feed_id: &str,
+        url: &str,
+        types: &[String],
+        page_size: usize,
+        max_pages: usize,
+        since: Option<String>,
+        auth: Option<&RemoteAuth>,
+    ) -> Result<Self> {
+        let env = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .with_context(|| {
+                    format!("environment variable {name} (named in the source's auth) is not set")
+                })
+        };
+        let (credentials, bearer) = match auth {
+            None => (None, None),
+            Some(RemoteAuth::Bearer { token_env }) => (None, Some(env(token_env)?)),
+            Some(RemoteAuth::ClientCredentials {
+                token_url,
+                client_id,
+                client_secret_env,
+                scope,
+            }) => (
+                Some(Arc::new(TokenSource::new(CredentialSettings {
+                    token_url: token_url.clone(),
+                    client_id: client_id.clone(),
+                    client_secret: env(client_secret_env)?,
+                    scope: scope.clone(),
+                }))),
+                None,
+            ),
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("HTTP client");
+        Ok(Self {
+            feed_id: feed_id.to_string(),
+            base: url.trim_end_matches('/').to_string(),
+            types: types.to_vec(),
+            page_size,
+            max_pages,
+            since,
+            http,
+            credentials,
+            bearer,
+            db: None,
+            pulled: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn cursor(&self, resource_type: &str) -> Result<Option<String>> {
+        match &self.db {
+            Some(db) => Ok(db
+                .cursor(&self.feed_id, resource_type)?
+                .or_else(|| self.since.clone())),
+            None => Ok(self.since.clone()),
+        }
+    }
+
+    async fn get(&self, url: &str) -> Result<serde_json::Value> {
+        let mut request = self.http.get(url).header("Accept", "application/fhir+json");
+        if let Some(token) = &self.bearer {
+            request = request.bearer_auth(token);
+        }
+        if let Some(source) = &self.credentials {
+            let token = source
+                .bearer()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("cannot reach {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "{url} answered {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        response
+            .json()
+            .await
+            .with_context(|| format!("{url} did not answer with JSON"))
+    }
+
+    /// Searches one type for what changed after its cursor, page by page.
+    async fn pull(&self, resource_type: &str) -> Result<Pulled> {
+        let cursor = self.cursor(resource_type)?;
+        let mut url = format!(
+            "{}/{resource_type}?_sort=_lastUpdated&_count={}",
+            self.base, self.page_size
+        );
+        if let Some(c) = &cursor {
+            url.push_str(&format!("&_lastUpdated=gt{c}"));
+        }
+        let mut bytes = Vec::new();
+        let mut count = 0;
+        let mut newest = cursor.clone().unwrap_or_default();
+        let mut next = Some(url);
+        let mut pages = 0;
+        while let Some(url) = next.take() {
+            if pages >= self.max_pages {
+                break;
+            }
+            pages += 1;
+            let bundle = self.get(&url).await?;
+            for entry in bundle["entry"].as_array().into_iter().flatten() {
+                let resource = &entry["resource"];
+                if resource.get("resourceType").and_then(|t| t.as_str()) != Some(resource_type) {
+                    continue;
+                }
+                if let Some(at) = resource["meta"]["lastUpdated"].as_str()
+                    && later(at, &newest)
+                {
+                    newest = at.to_string();
+                }
+                bytes.extend_from_slice(resource.to_string().as_bytes());
+                bytes.push(b'\n');
+                count += 1;
+            }
+            next = bundle["link"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|l| l["relation"] == "next")
+                .and_then(|l| l["url"].as_str())
+                .map(str::to_string);
+        }
+        Ok(Pulled {
+            bytes,
+            count,
+            newest,
+        })
+    }
+
+    async fn list(&self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for resource_type in &self.types {
+            let pulled = self.pull(resource_type).await?;
+            if pulled.count == 0 {
+                continue;
+            }
+            tracing::debug!(feed = %self.feed_id, resource_type, resources = pulled.count, newest = %pulled.newest, "pulled");
+            self.pulled
+                .lock()
+                .expect("pulled mutex")
+                .insert(resource_type.clone(), pulled);
+            keys.push(resource_type.clone());
+        }
+        Ok(keys)
+    }
+
+    fn fetch(&self, key: &str) -> Result<Incoming> {
+        let pulled = self.pulled.lock().expect("pulled mutex");
+        let p = pulled
+            .get(key)
+            .with_context(|| format!("{key} was not pulled in this pass"))?;
+        Ok(Incoming {
+            key: key.to_string(),
+            name: format!("{key}-{}.ndjson", Utc::now().format("%Y%m%dT%H%M%SZ")),
+            bytes: p.bytes.clone(),
+        })
+    }
+
+    /// The records are stored: the cursor may move past them.
+    fn acknowledge(&self, key: &str) -> Result<String> {
+        let newest = self
+            .pulled
+            .lock()
+            .expect("pulled mutex")
+            .remove(key)
+            .map(|p| p.newest)
+            .with_context(|| format!("{key} was not pulled in this pass"))?;
+        if let Some(db) = &self.db
+            && !newest.is_empty()
+        {
+            db.set_cursor(&self.feed_id, key, &newest)?;
+        }
+        Ok(format!("cursor {newest}"))
+    }
+
+    /// The server's capability statement, then what each type holds past its cursor.
+    async fn probe(&self, started: Instant) -> Result<Probe> {
+        self.get(&format!("{}/metadata", self.base)).await?;
+        let mut objects = 0;
+        let mut newest: Option<(String, String)> = None;
+        for resource_type in &self.types {
+            let mut url = format!("{}/{resource_type}?_sort=-_lastUpdated&_count=1", self.base);
+            if let Some(c) = self.cursor(resource_type)? {
+                url.push_str(&format!("&_lastUpdated=gt{c}"));
+            }
+            let bundle = self.get(&url).await?;
+            objects += bundle["total"].as_u64().unwrap_or(0) as usize;
+            if let Some(at) = bundle["entry"][0]["resource"]["meta"]["lastUpdated"].as_str()
+                && newest.as_ref().is_none_or(|(_, n)| later(at, n))
+            {
+                newest = Some((resource_type.clone(), at.to_string()));
+            }
+        }
+        Ok(Probe {
+            reachable: true,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            objects,
+            newest: newest.as_ref().map(|(t, _)| t.clone()),
+            newest_at: newest.map(|(_, at)| at),
+        })
+    }
+}
+
+/// Whether instant `a` is after `b`, comparing as instants when both parse and as
+/// text otherwise (an empty `b` is before everything).
+fn later(a: &str, b: &str) -> bool {
+    if b.is_empty() {
+        return true;
+    }
+    match (
+        DateTime::parse_from_rfc3339(a),
+        DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => a > b,
     }
 }
 

@@ -1,0 +1,22 @@
+# Another FHIR server, pulled into HFS. Copy to other-fhir.yaml and fill in.
+id: other-fhir
+name: Other FHIR server
+source:
+  type: fhir_server
+  url: https://other.example.org/fhir
+  types: [Patient, Encounter, Observation]
+  poll_seconds: 300
+  page_size: 200          # _count per page
+  max_pages: 20           # pages per type per pass; the rest waits for the next pass
+  # since: 2026-01-01T00:00:00Z   # where to start the first time; everything when unset
+  auth:                   # or omit for an open server
+    method: client_credentials
+    token_url: https://idp.example.org/realms/fhir/protocol/openid-connect/token
+    client_id: hie-puller
+    client_secret_env: OTHER_FHIR_CLIENT_SECRET   # the secret is read from this variable
+    # scope: system/*.rs
+  # auth:
+  #   method: bearer
+  #   token_env: OTHER_FHIR_TOKEN
+transform: transforms/fhir_passthrough.py
+expect_every: 24h
