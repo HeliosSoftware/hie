@@ -403,11 +403,7 @@ impl FeedRunner {
             // entry is staged where HFS can fetch it and kept until the receipts.
             let staged = if self.bulk.is_some() && !self.bulk_transformed {
                 let base = format!("{}.ndjson", taken + 1);
-                match self
-                    .source
-                    .put_unpacked(container, &base, data.clone())
-                    .await?
-                {
+                match self.source.put_unpacked(container, &base, &data).await? {
                     Some(key) => Some(key),
                     None => {
                         let dir = self.bulk_dir.join("unpacked").join(container.to_string());

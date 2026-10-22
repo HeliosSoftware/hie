@@ -428,7 +428,7 @@ impl Source {
         &self,
         container: i64,
         name: &str,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> Result<Option<String>> {
         let Source::Object(o) = self else {
             return Ok(None);
@@ -438,7 +438,7 @@ impl Source {
         }
         let key = format!("{}/unpacked/{container}/{name}", o.archive);
         o.store
-            .put(&ObjectPath::from(key.as_str()), bytes.into())
+            .put(&ObjectPath::from(key.as_str()), bytes.to_vec().into())
             .await
             .with_context(|| format!("writing {key}"))?;
         Ok(Some(key))
