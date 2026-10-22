@@ -420,6 +420,30 @@ impl Source {
         Ok(Some(key))
     }
 
+    /// Writes an entry unpacked from a zip next to the archive, so HFS can fetch
+    /// it by a pre-signed URL on the `source_objects` bulk path. `None` when the
+    /// store cannot be written or cannot sign: the engine then keeps the entry
+    /// itself and serves it.
+    pub async fn put_unpacked(
+        &self,
+        container: i64,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Option<String>> {
+        let Source::Object(o) = self else {
+            return Ok(None);
+        };
+        if o.signer.is_none() || o.read_only {
+            return Ok(None);
+        }
+        let key = format!("{}/unpacked/{container}/{name}", o.archive);
+        o.store
+            .put(&ObjectPath::from(key.as_str()), bytes.into())
+            .await
+            .with_context(|| format!("writing {key}"))?;
+        Ok(Some(key))
+    }
+
     /// Removes what `put_submission_file` wrote for a submission, once HFS has
     /// read it and answered.
     pub async fn remove_submission_files(&self, token: &str) -> Result<()> {

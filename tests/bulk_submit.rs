@@ -463,3 +463,138 @@ async fn a_csv_is_transformed_and_submitted_in_bulk() {
         .unwrap();
     assert_eq!(again[0]["resources"][0]["id"], id);
 }
+
+/// A zipped NDJSON export on the source_objects bulk path: the engine unpacks it,
+/// stages each entry where HFS can read it (here: served by the engine, since a
+/// folder cannot sign URLs), submits them, and removes the staged files once the
+/// receipts are in.
+#[tokio::test]
+async fn a_zipped_export_is_staged_and_submitted() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let consumer = Consumer {
+        base: Arc::default(),
+        submissions: Arc::default(),
+    };
+    let (hfs_listener, hfs_url) = bind().await;
+    *consumer.base.lock().unwrap() = hfs_url.clone();
+    let hfs = Router::new()
+        .route("/$bulk-submit", post(kickoff))
+        .route("/$bulk-submit-status", post(status_kickoff))
+        .route("/bulk-submit-status/{id}", get(poll))
+        .route("/bulk-submit-file/{id}/{part}", get(artifact))
+        .with_state(consumer.clone());
+    tokio::spawn(async move { axum::serve(hfs_listener, hfs).await.unwrap() });
+
+    let (hie_listener, hie_url) = bind().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/fhir_passthrough.py"),
+        root.join("transforms/fhir_passthrough.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {hfs_url}\npublic_url: {hie_url}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/exports.yaml"),
+        "id: exports\nname: Exports\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.zip\"\n  poll_seconds: 60\n  min_file_age_ms: 0\n\
+         format: ndjson\ntransform: transforms/fhir_passthrough.py\ndelivery:\n  method: bulk_submit\n  initial_backoff_ms: 10\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    assert!(
+        !feeds[0].bulk_transformed(),
+        "NDJSON with the passthrough takes the source_objects path"
+    );
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("exports", None).unwrap();
+    let runner = manager.runner("exports").unwrap();
+    let db = state.db.clone();
+    let bulk_dir = state.bulk_dir.clone();
+    let router = hie::api::router(state);
+    tokio::spawn(async move { axum::serve(hie_listener, router).await.unwrap() });
+
+    // The zip the way an export tool writes it: a folder, NDJSON per type, a manifest.
+    let zip_bytes = {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("out/Patient.ndjson", options).unwrap();
+        zip.write_all(b"{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n{\"resourceType\":\"Patient\",\"id\":\"p2\"}\n").unwrap();
+        zip.start_file("out/Observation.ndjson", options).unwrap();
+        zip.write_all(b"{\"resourceType\":\"Observation\",\"id\":\"o1\"}\n{\"resourceType\":\"Observation\"}\n").unwrap();
+        zip.start_file("out/manifest.json", options).unwrap();
+        zip.write_all(b"{\"output\": []}\n").unwrap();
+        zip.finish().unwrap();
+        buf.into_inner()
+    };
+    let inbox = root.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(inbox.join("export.zip"), zip_bytes).unwrap();
+
+    // Pass 1: unpacked, staged under bulk_dir, submitted; HFS fetched both entries from the engine.
+    runner.tick().await.unwrap();
+    let counts = db.feed_counts("exports").unwrap();
+    assert_eq!(
+        (
+            counts["files"].as_i64(),
+            counts["submitted"].as_i64(),
+            counts["rejected"].as_i64()
+        ),
+        (Some(3), Some(3), Some(1)),
+        "{counts}"
+    );
+    assert!(
+        !inbox.join("export.zip").exists(),
+        "the zip itself is archived at once"
+    );
+    let staged: Vec<String> = db
+        .query_json(
+            "SELECT source_key FROM files WHERE source_key IS NOT NULL AND archived = 0 ORDER BY id",
+            [],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r["source_key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(staged.len(), 2, "{staged:?}");
+    assert!(
+        staged
+            .iter()
+            .all(|k| k.starts_with(&bulk_dir.to_string_lossy().to_string())
+                && std::path::Path::new(k).is_file()),
+        "{staged:?}"
+    );
+    {
+        let subs = consumer.submissions.lock().unwrap();
+        let sub = subs.values().next().expect("HFS received the submission");
+        let mut refs = sub.references.clone();
+        refs.sort();
+        assert_eq!(refs, ["Observation/o1", "Patient/p1", "Patient/p2"]);
+    }
+
+    // Passes 2 and 3: receipts in, records settled, staged entries removed.
+    runner.tick().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    runner.tick().await.unwrap();
+    let counts = db.feed_counts("exports").unwrap();
+    assert_eq!(
+        (counts["sent"].as_i64(), counts["submitted"].as_i64()),
+        (Some(3), Some(0)),
+        "{counts}"
+    );
+    assert!(
+        staged.iter().all(|k| !std::path::Path::new(k).exists()),
+        "staged entries removed: {staged:?}"
+    );
+}
