@@ -366,6 +366,56 @@ impl ObjectSource {
         self.signer = Some(signer);
         self
     }
+
+    fn submission_prefix(&self, token: &str) -> String {
+        format!("{}/submissions/{token}", self.archive)
+    }
+}
+
+impl Source {
+    /// Writes a file the engine produced for a submission next to the archive, so
+    /// HFS can fetch it from the store by a pre-signed URL. `None` when the
+    /// source has no store (a folder): the engine then serves the file itself.
+    pub async fn put_submission_file(
+        &self,
+        token: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Option<String>> {
+        let Source::Object(o) = self else {
+            return Ok(None);
+        };
+        if o.signer.is_none() {
+            return Ok(None);
+        }
+        let key = format!("{}/{name}", o.submission_prefix(token));
+        o.store
+            .put(&ObjectPath::from(key.as_str()), bytes.into())
+            .await
+            .with_context(|| format!("writing {key}"))?;
+        Ok(Some(key))
+    }
+
+    /// Removes what `put_submission_file` wrote for a submission, once HFS has
+    /// read it and answered.
+    pub async fn remove_submission_files(&self, token: &str) -> Result<()> {
+        let Source::Object(o) = self else {
+            return Ok(());
+        };
+        let prefix = ObjectPath::from(o.submission_prefix(token));
+        let mut stream = o.store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(meta) = stream.next().await {
+            keys.push(meta.context("listing submission files")?.location);
+        }
+        for key in keys {
+            o.store
+                .delete(&key)
+                .await
+                .with_context(|| format!("removing {key}"))?;
+        }
+        Ok(())
+    }
 }
 
 impl Source {

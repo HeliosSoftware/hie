@@ -3,7 +3,11 @@
 Protocol, one JSON object per line:
   request  {"id": 1, "record": {...}, "context": {"feed": ..., "file": ..., "line": ...}}
   response {"id": 1, "resources": [...]}
-        or {"id": 1, "error": {"kind": "data" | "transform", "message": ...}}
+        or {"id": 1, "error": {"kind": "data" | "transform" | "transient", "message": ...}}
+
+`data` rejects the record, `transform` rejects it as a bug in the script, and
+`transient` (a terminology server that cannot be reached) makes the engine try
+the record again later.
 
 The script defines `transform(record, context)` returning a resource, a list of
 resources or None. It raises `hie.DataError` for bad source data.
@@ -17,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hie import DataError  # noqa: E402
+from hie import DataError, TerminologyError  # noqa: E402
 
 
 def load(path):
@@ -48,6 +52,8 @@ def main():
             reply = {"id": request["id"], "resources": result}
         except DataError as e:
             reply = {"id": request["id"], "error": {"kind": "data", "message": str(e)}}
+        except TerminologyError as e:  # the server, not the row: the engine retries later
+            reply = {"id": request["id"], "error": {"kind": "transient", "message": str(e)}}
         except Exception as e:  # a bug in the transform, kept with its traceback
             reply = {
                 "id": request["id"],

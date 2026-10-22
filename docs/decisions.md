@@ -244,7 +244,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - Objects stay at the source until the receipts are in, so a retry or a replacement manifest can point at them again, and a pre-signed URL never points at an archived key.
 
 **Cost:**
-- A resource without an `id` cannot go this way; the pre-flight rejects it and says so.
+- A resource without an `id` cannot go this way; the pre-flight rejects it and says so. (Decision 29 adds the `transformed` path, where the engine derives one.)
 - A line HFS refuses that the pre-flight did not predict is rejected with "no receipt", plus HFS's first error text, without a certain attribution.
 - The engine's `public_url` must be reachable from HFS, and the folder-file route must stay open (unguessable token in the path).
 
@@ -333,6 +333,29 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - The synchronous client on its own thread rather than an async store: the pipeline calls the store from many places; making them all async would have touched every call site for no gain, since a SQLite call blocks the same way.
 
 **Cost / not yet:** no TLS to PostgreSQL yet (same host or a private network); one connection per instance, no pool; a `check-now` reaches only the instance it was sent to; no per-record parallelism within a source.
+
+## 29. `$bulk-submit` from any source: the engine writes the NDJSON, and derives ids
+
+**Chosen:** `delivery.bulk_from` says what a manifest points at. `source_objects` is decision 21 unchanged. `transformed` runs the transform as the REST path does, writes the resources as NDJSON per resource type, and hands those files to HFS: in the source's own store by pre-signed URL when the source is S3, else served by the engine from `bulk_dir`. A resource with only an `identifier` gets an `id` derived from it (SHA-256 of `system|value`, 48 hex characters), kept alongside the identifier. `auto`, the default, picks `source_objects` only for NDJSON or Bundle files with the passthrough transform. The source file is archived once read; the engine's files are removed once the receipts are in.
+
+**Why:**
+- A customer sends a lab CSV, not a manifest. The bulk path must work from whatever arrives, with the same transform and the same rejection of bad rows as the REST path, or it is a path only for exports.
+- `$bulk-submit` stores by id, and a lab row has an identifier, not an id. Deriving the id from the identifier keeps the one promise that matters, that re-sending the row updates rather than duplicates, without asking every transform to invent ids.
+- Writing the NDJSON into the source's bucket for an S3 source means HFS fetches from S3 by pre-signed URL, as it does for exports, and the engine's `public_url` need not be reachable from HFS: an engine on a laptop can bulk-submit to a public HFS.
+- Bad rows never reach the file: the transform rejects them with line and reason before the manifest exists; what HFS refuses comes back as a receipt, mapped by the derived id.
+
+**Cost / not yet:** the derived id is opaque (a hash), so a resource created this way is found by its identifier, not by a readable id; a record whose transform returns several resources is settled on its first; the `auto` rule looks at the transform's file name, so a custom passthrough should set `bulk_from` explicitly.
+
+## 30. Terminology in transforms: HTS through two helpers, with a fallback
+
+**Chosen:** `terminology_url` in `hie.yaml` (`HIE_TERMINOLOGY_SERVER` overrides it, `HIE_TERMINOLOGY_TOKEN` adds a bearer) names an HTS. The engine hands it to the worker, and a transform calls `lookup(system, code)` (`CodeSystem/$lookup`: the display, or `None` when the code is unknown) and `translate(code, source_system, target_system)` (`ConceptMap/$translate`: the first equivalent target concept, or `None`). Answers are cached for the life of the worker. A server that cannot be reached raises `TerminologyError`, which the worker reports as `transient`: the engine keeps the record and tries again later, with the outage alerts saying why. Without a server both helpers answer `None`, so a transform keeps a fallback (a local table) or rejects the row. `lab_results.py` validates LOINC codes against the server and takes their display from it, and translates local codes through the server's ConceptMap before its own table.
+
+**Why:**
+- A lab's codes are local and must become LOINC; the mapping belongs in the terminology server, where it is maintained by the people who own terminology, not in a dictionary inside a script.
+- A code HTS does not know is a data error worth stopping on; a server that is down is not, and must not turn rows into rejections.
+- Two helpers rather than a FHIR client in every transform: the transform author writes `lookup` and `translate`, and the runtime decides how to reach the server, which is also what the shared Python runtime will do.
+
+**Cost / not yet:** `$validate-code` against a ValueSet, `$expand`, and `$subsumes` are not wrapped; the cache is per worker process and forgets on restart; a token for HTS is a single static one, not the engine's client credentials.
 
 ## Not in the prototype
 

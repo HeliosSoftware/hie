@@ -13,7 +13,13 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Resources(Vec<Value>),
-    Rejected { kind: String, message: String },
+    Rejected {
+        kind: String,
+        message: String,
+    },
+    /// Something the transform depends on (the terminology server) was not
+    /// there: the record is kept and tried again later.
+    Transient(String),
 }
 
 /// A long-lived Python process running one feed's transform script.
@@ -21,6 +27,8 @@ pub struct Transformer {
     python: String,
     worker_script: PathBuf,
     transform_script: PathBuf,
+    /// The HTS the worker may ask, handed over as `HIE_TERMINOLOGY_SERVER`.
+    terminology: Option<String>,
     worker: Mutex<Option<Worker>>,
 }
 
@@ -37,15 +45,25 @@ impl Transformer {
             python: python.to_string(),
             worker_script: runtime_dir.join("worker.py"),
             transform_script: transform_script.to_path_buf(),
+            terminology: None,
             worker: Mutex::new(None),
         }
     }
 
+    pub fn set_terminology(&mut self, url: Option<&str>) {
+        self.terminology = url.map(str::to_string);
+    }
+
     async fn spawn(&self) -> Result<Worker> {
-        let mut child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-u")
             .arg(&self.worker_script)
-            .arg(&self.transform_script)
+            .arg(&self.transform_script);
+        if let Some(url) = &self.terminology {
+            command.env("HIE_TERMINOLOGY_SERVER", url);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -135,6 +153,9 @@ fn parse_reply(reply: &Value) -> Outcome {
         if let Some(trace) = err.get("trace").and_then(Value::as_str) {
             message = format!("{message}\n{trace}");
         }
+        if kind == "transient" {
+            return Outcome::Transient(message);
+        }
         return Outcome::Rejected { kind, message };
     }
     let resources = reply
@@ -143,6 +164,27 @@ fn parse_reply(reply: &Value) -> Outcome {
         .cloned()
         .unwrap_or_default();
     Outcome::Resources(resources)
+}
+
+/// Gives a resource that has only an identifier an `id` derived from it, so it
+/// can go where only ids are accepted (`$bulk-submit`) and still be the same
+/// resource every time it is sent: 48 hex characters of the SHA-256 of
+/// `system|value`, which fits FHIR's id rules.
+pub fn derive_id(resource: &mut Value) -> std::result::Result<DeliveryKey, String> {
+    match check_resource(resource)? {
+        key @ DeliveryKey::Id { .. } => Ok(key),
+        DeliveryKey::Identifier {
+            resource_type,
+            system,
+            value,
+        } => {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(format!("{system}|{value}").as_bytes());
+            let id = hex::encode(digest)[..48].to_string();
+            resource["id"] = Value::String(id.clone());
+            Ok(DeliveryKey::Id { resource_type, id })
+        }
+    }
 }
 
 /// Checks what HIE itself relies on: a resource type, and a key that makes delivery

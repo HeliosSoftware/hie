@@ -150,6 +150,10 @@ jobs:
           # The engine's store: a postgres:// URL for a shared store, else the
           # SQLite file under /opt/hie/data.
           HIE_DATABASE_URL: ${{ secrets.HIE_DATABASE_URL }}
+          # The terminology server transforms may ask (lookup, translate). The
+          # public HTS by default; a token only where that HTS requires one.
+          HIE_TERMINOLOGY_SERVER: ${{ secrets.HIE_TERMINOLOGY_SERVER || 'https://hts.heliossoftware.com' }}
+          HIE_TERMINOLOGY_TOKEN: ${{ secrets.HIE_TERMINOLOGY_TOKEN }}
         run: |
           set -eu
           SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST"
@@ -210,6 +214,8 @@ jobs:
           else
             echo "HIE_DATABASE_URL is not set: the store is the SQLite file under /opt/hie/data"
           fi
+          printf 'HIE_TERMINOLOGY_SERVER=%s\nHIE_TERMINOLOGY_TOKEN=%s\n' "$HIE_TERMINOLOGY_SERVER" "$HIE_TERMINOLOGY_TOKEN" | \
+            $SSH "sudo sh -c 'umask 077; cat >> /etc/hie/hie.env'"
 
           $SSH "sudo tee /etc/systemd/system/hie.service > /dev/null <<EOF
           [Unit]

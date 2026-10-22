@@ -1099,6 +1099,21 @@ impl Db {
         Ok(files)
     }
 
+    /// Pending records of a feed that no submission holds yet, with their
+    /// resources: what the engine writes out itself on the transformed bulk path.
+    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, Value)>> {
+        Ok(self
+            .query(
+                "SELECT id, resources FROM records
+                 WHERE feed_id = $1 AND status = 'pending' AND submission IS NULL
+                 ORDER BY id LIMIT $2",
+                &params![feed, limit],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.json(1).unwrap_or(Value::Null)))
+            .collect())
+    }
+
     /// Opens a submission over the given records, which move to `submitted`.
     pub fn create_submission(
         &self,

@@ -341,10 +341,10 @@ fn a_fhir_server_source_is_checked_on_resolve() {
     assert!(err.contains("http://"), "{err}");
     let err = parse(
         "  type: fhir_server\n  url: http://x\n  types: [Patient]",
-        "delivery:\n  method: bulk_submit\n",
+        "delivery:\n  method: bulk_submit\n  bulk_from: source_objects\n",
     )
     .unwrap_err();
-    assert!(err.contains("cannot deliver by bulk_submit"), "{err}");
+    assert!(err.contains("has no file for HFS to fetch"), "{err}");
     let ok = parse(
         "  type: fhir_server\n  url: http://x\n  types: [Patient]",
         "",

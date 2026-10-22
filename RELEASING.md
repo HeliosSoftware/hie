@@ -22,6 +22,7 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
    - `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER`, `HIE_AUTH_AUDIENCE` (only for a secure environment; without them the API is deployed open, like the public sandbox)
    - `HIE_FHIR_TOKEN_URL`, `HIE_FHIR_CLIENT_ID`, `HIE_FHIR_CLIENT_SECRET`, `HIE_FHIR_SCOPE` (only for a secure environment whose HFS requires a token; without them the engine calls HFS anonymously, as the sandbox does against the public HFS)
    - `HIE_DATABASE_URL` (optional: a `postgres://` URL for a shared store; without it the engine keeps its SQLite file under `/opt/hie/data`)
+   - `HIE_TERMINOLOGY_SERVER`, `HIE_TERMINOLOGY_TOKEN` (optional: the HTS transforms may ask; the public HTS by default, the token only where that HTS requires one)
 
 4. Ensure the self-hosted runners are online. Every job runs on `self-hosted`; the deploy job needs a runner labelled `Deploy` whose user can SSH to `HIE_DEPLOY_USER@HIE_DEPLOY_HOST` with a key in its `~/.ssh`. That user needs passwordless `sudo` on the host.
 
@@ -33,7 +34,7 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-python3 -m unittest tests/test_lab_results.py tests/test_hl7.py
+python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py
 HIE_TEST_PYTHON=python3 cargo test
 docker build -t hie:local . && docker run --rm hie:local check
 ```

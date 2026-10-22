@@ -291,12 +291,12 @@ fn an_mllp_source_is_checked_on_resolve() {
     let err = format!("{:#}", feed.resolve(&repo()).unwrap_err());
     assert!(err.contains("0.0.0.0:2575"), "{err}");
     let mut feed: hie::config::FeedConfig = serde_yaml::from_str(
-        "id: x\nname: X\nsource:\n  type: mllp\n  listen: 0.0.0.0:2575\ntransform: transforms/hl7_adt_patient.py\ndelivery:\n  method: bulk_submit\n",
+        "id: x\nname: X\nsource:\n  type: mllp\n  listen: 0.0.0.0:2575\ntransform: transforms/hl7_adt_patient.py\ndelivery:\n  method: bulk_submit\n  bulk_from: source_objects\n",
     )
     .unwrap();
     let err = format!("{:#}", feed.resolve(&repo()).unwrap_err());
     assert!(
-        err.contains("mllp source cannot deliver by bulk_submit"),
+        err.contains("mllp source has no file for HFS to fetch"),
         "{err}"
     );
     let mut feed: hie::config::FeedConfig = serde_yaml::from_str(

@@ -245,11 +245,11 @@ fn a_database_source_is_checked_on_resolve() {
     assert!(err.contains("column name"), "{err}");
     let err = parse(
         "  url_env: X\n  query: SELECT 1 WHERE id > {cursor}\n  cursor_column: id",
-        "delivery:\n  method: bulk_submit\n",
+        "delivery:\n  method: bulk_submit\n  bulk_from: source_objects\n",
     )
     .unwrap_err();
     assert!(
-        err.contains("database source cannot deliver by bulk_submit"),
+        err.contains("database source has no file for HFS to fetch"),
         "{err}"
     );
     let ok = parse(

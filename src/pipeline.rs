@@ -1,9 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use chrono::Timelike;
@@ -41,6 +41,10 @@ pub struct FeedRunner {
     outage_alerted: AtomicBool,
     /// Which engine instance this runner acts as, for the source's lease.
     instance: String,
+    /// Where transformed submissions are written when the engine serves them.
+    bulk_dir: PathBuf,
+    /// `$bulk-submit` over the engine's transformed NDJSON, not the source objects.
+    bulk_transformed: bool,
 }
 
 /// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
@@ -106,6 +110,7 @@ impl FeedRunner {
         public_url: &str,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
+        let feed_bulk_transformed = feed.bulk_transformed();
         let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
             BulkSubmitter::new(fhir_base_url, public_url)
                 .with_credentials(fhir.credentials().clone())
@@ -120,6 +125,8 @@ impl FeedRunner {
             alerts,
             started_at: now_ms(),
             instance: instance_id().to_string(),
+            bulk_dir: std::env::temp_dir().join("hie-bulk"),
+            bulk_transformed: feed_bulk_transformed,
             outage_alerted: AtomicBool::new(false),
         }
     }
@@ -142,6 +149,18 @@ impl FeedRunner {
 
     pub fn instance(&self) -> &str {
         &self.instance
+    }
+
+    /// Where this runner writes the NDJSON of transformed submissions.
+    pub fn with_bulk_dir(mut self, dir: &Path) -> Self {
+        self.bulk_dir = dir.to_path_buf();
+        self
+    }
+
+    /// The terminology server the transform may ask.
+    pub fn with_terminology(mut self, url: Option<&str>) -> Self {
+        self.transformer.set_terminology(url);
+        self
     }
 
     /// How long a pass may hold the source before another instance may take it:
@@ -202,7 +221,11 @@ impl FeedRunner {
     pub async fn tick(&self) -> Result<()> {
         self.scan().await?;
         if self.bulk.is_some() {
-            self.preflight_received()?;
+            if self.bulk_transformed {
+                self.transform_received().await?;
+            } else {
+                self.preflight_received()?;
+            }
             self.submit_pending().await?;
             self.poll_submissions().await?;
         } else {
@@ -250,7 +273,7 @@ impl FeedRunner {
         }
 
         // On the bulk path the object stays at its source until HFS has read it.
-        let keep = self.bulk.is_some();
+        let keep = self.bulk.is_some() && !self.bulk_transformed;
         let file_id = self.db.insert_file(
             feed,
             &name,
@@ -307,6 +330,11 @@ impl FeedRunner {
                     }
                 };
                 match outcome {
+                    Outcome::Transient(message) => {
+                        // Not the row's fault: leave it and the rest for the next pass.
+                        tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
+                        return Ok(());
+                    }
                     Outcome::Rejected { kind, message } => {
                         self.db.mark_rejected(item.id, &kind, &message, None)?
                     }
@@ -318,12 +346,21 @@ impl FeedRunner {
                             None,
                         )?
                     }
-                    Outcome::Resources(resources) => {
-                        match resources
-                            .iter()
-                            .map(transform::check_resource)
-                            .collect::<Result<Vec<_>, _>>()
-                        {
+                    Outcome::Resources(mut resources) => {
+                        // On the transformed bulk path a resource must carry an id:
+                        // one is derived from the identifier when there is none.
+                        let checked = if self.bulk_transformed {
+                            resources
+                                .iter_mut()
+                                .map(transform::derive_id)
+                                .collect::<Result<Vec<_>, _>>()
+                        } else {
+                            resources
+                                .iter()
+                                .map(transform::check_resource)
+                                .collect::<Result<Vec<_>, _>>()
+                        };
+                        match checked {
                             Ok(_) => self
                                 .db
                                 .mark_transformed(item.id, &Value::Array(resources))?,
@@ -367,6 +404,9 @@ impl FeedRunner {
         let Some(bulk) = &self.bulk else {
             return Ok(());
         };
+        if self.bulk_transformed {
+            return self.submit_transformed(bulk).await;
+        }
         loop {
             let files = self
                 .db
@@ -542,7 +582,94 @@ impl FeedRunner {
                 )?,
             }
         }
-        self.archive_submission(token).await
+        self.archive_submission(token).await?;
+        self.remove_submission_files(token).await;
+        Ok(())
+    }
+
+    /// Drops what the engine wrote for a transformed submission, now that HFS has
+    /// read it and answered.
+    async fn remove_submission_files(&self, token: &str) {
+        let dir = self.bulk_dir.join(token);
+        if dir.is_dir()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            tracing::warn!(feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
+        }
+        if let Err(e) = self.source.remove_submission_files(token).await {
+            tracing::warn!(feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
+        }
+    }
+
+    /// Writes the pending records' resources as NDJSON per resource type, in the
+    /// source's store when it can sign URLs (HFS fetches from there) or under
+    /// `bulk_dir` served by the engine, and opens one submission over them.
+    async fn submit_transformed(&self, bulk: &BulkSubmitter) -> Result<()> {
+        loop {
+            let records = self
+                .db
+                .submittable_records(&self.feed.id, self.feed.delivery.bulk_records_max)?;
+            if records.is_empty() {
+                return Ok(());
+            }
+            let token = bulk::token();
+            let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
+            let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for (_, resources) in &records {
+                for resource in resources.as_array().into_iter().flatten() {
+                    let kind = resource["resourceType"]
+                        .as_str()
+                        .unwrap_or("Resource")
+                        .to_string();
+                    let lines = by_type.entry(kind.clone()).or_default();
+                    lines.extend_from_slice(resource.to_string().as_bytes());
+                    lines.push(b'\n');
+                    *counts.entry(kind).or_default() += 1;
+                }
+            }
+            let mut entries = Vec::new();
+            for (n, (kind, bytes)) in by_type.into_iter().enumerate() {
+                let n = n as i64 + 1;
+                let name = format!("{n}.ndjson");
+                let shared = match self
+                    .source
+                    .put_submission_file(&token, &name, bytes.clone())
+                    .await?
+                {
+                    Some(key) => self.source.share(&key, ttl).await?,
+                    None => None,
+                };
+                let url = match shared {
+                    Some(url) => url,
+                    None => {
+                        let dir = self.bulk_dir.join(&token);
+                        std::fs::create_dir_all(&dir)
+                            .with_context(|| format!("creating {}", dir.display()))?;
+                        std::fs::write(dir.join(&name), &bytes)
+                            .with_context(|| format!("writing {}", dir.join(&name).display()))?;
+                        bulk.file_url(&token, n)
+                    }
+                };
+                entries.push((kind.clone(), url, counts[&kind]));
+            }
+            let record_ids: Vec<i64> = records.iter().map(|(id, _)| *id).collect();
+            let span = format!(
+                "records {}-{}",
+                record_ids[0],
+                record_ids[record_ids.len() - 1]
+            );
+            let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
+            let manifest = bulk.manifest(&entries);
+            self.db.create_submission(
+                &token,
+                &self.feed.id,
+                &submission_id,
+                &manifest,
+                &record_ids,
+            )?;
+            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
+        }
     }
 
     async fn archive_submission(&self, token: &str) -> Result<()> {

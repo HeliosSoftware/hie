@@ -20,6 +20,8 @@ pub struct AppState {
     pub manager: Arc<SourceManager>,
     pub auth: crate::auth::Auth,
     pub started: Started,
+    /// Where the engine writes the NDJSON it serves for transformed submissions.
+    pub bulk_dir: std::path::PathBuf,
 }
 
 /// When the process came up, for the uptime that `/health` reports.
@@ -109,10 +111,18 @@ async fn bulk_file(
     State(s): State<AppState>,
     Path((token, file_id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
-    let key =
+    // A file the engine wrote for a transformed submission, or else the source
+    // file as it arrived (the source_objects path on a folder).
+    let engine_file = s.bulk_dir.join(&token).join(format!("{file_id}.ndjson"));
+    let path = if engine_file.is_file() && s.db.submission(&token)?.is_some() {
+        engine_file.to_string_lossy().into_owned()
+    } else {
         s.db.submission_file(&token, file_id)?
-            .ok_or_else(|| not_found("file"))?;
-    let bytes = tokio::fs::read(&key).await.map_err(|_| not_found("file"))?;
+            .ok_or_else(|| not_found("file"))?
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| not_found("file"))?;
     Ok(([(header::CONTENT_TYPE, "application/fhir+ndjson")], bytes).into_response())
 }
 

@@ -47,6 +47,8 @@ pub struct SourceManager {
     sources_dir: PathBuf,
     transforms_dir: PathBuf,
     base_dir: PathBuf,
+    bulk_dir: PathBuf,
+    terminology_url: Option<String>,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     alerts: Arc<Alerter>,
@@ -69,6 +71,8 @@ impl SourceManager {
             sources_dir: config.sources_dir.clone(),
             transforms_dir: config.transforms_dir.clone(),
             base_dir: config.base_dir.clone(),
+            bulk_dir: config.bulk_dir(),
+            terminology_url: config.terminology_url.clone(),
             db,
             fhir,
             alerts,
@@ -78,16 +82,20 @@ impl SourceManager {
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
     pub fn start(&self, feed: FeedConfig) -> Result<()> {
-        let runner = Arc::new(FeedRunner::new(
-            feed.clone(),
-            self.db.clone(),
-            self.fhir.clone(),
-            self.alerts.clone(),
-            &self.python,
-            &self.runtime_dir,
-            &self.fhir_base_url,
-            &self.public_url,
-        )?);
+        let runner = Arc::new(
+            FeedRunner::new(
+                feed.clone(),
+                self.db.clone(),
+                self.fhir.clone(),
+                self.alerts.clone(),
+                &self.python,
+                &self.runtime_dir,
+                &self.fhir_base_url,
+                &self.public_url,
+            )?
+            .with_bulk_dir(&self.bulk_dir)
+            .with_terminology(self.terminology_url.as_deref()),
+        );
         let control = Arc::new(RunnerControl::default());
         tokio::spawn(runner.clone().run(control.clone()));
         let previous = self.sources.lock().expect("manager mutex").insert(
@@ -404,7 +412,8 @@ impl SourceManager {
                 "transform {name} not found"
             )));
         }
-        let transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
+        let mut transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
+        transformer.set_terminology(self.terminology_url.as_deref());
         let mut out = Vec::with_capacity(records.len());
         for (i, record) in records.iter().enumerate() {
             let context = json!({"feed": "try", "file": "try", "line": i + 1});
@@ -415,6 +424,9 @@ impl SourceManager {
             out.push(match outcome {
                 Outcome::Rejected { kind, message } => {
                     json!({"record": record, "error": {"kind": kind, "message": message}})
+                }
+                Outcome::Transient(message) => {
+                    json!({"record": record, "error": {"kind": "transient", "message": message}})
                 }
                 Outcome::Resources(resources) => {
                     let problem = resources.iter().find_map(|r| check_resource(r).err());

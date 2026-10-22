@@ -43,6 +43,12 @@ async fn main() -> Result<()> {
     {
         config.database = PathBuf::from(url);
     }
+    if let Some(url) = std::env::var("HIE_TERMINOLOGY_SERVER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        config.terminology_url = Some(url);
+    }
     let runtime_dir = std::env::var_os("HIE_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

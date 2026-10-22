@@ -6,9 +6,12 @@ Columns: patient, code, display, value, unit, date.
 
 import re
 
-from hie import DataError
+from hie import DataError, has_code_system, lookup, translate
 
 IDENTIFIER_SYSTEM = "urn:helios:hie:lab-results"
+LOINC_SYSTEM = "http://loinc.org"
+# The system the lab's own codes are filed under in the terminology server's ConceptMap.
+LOCAL_SYSTEM = "urn:helios:hie:lab-results:local-codes"
 
 LOCAL_CODES = {
     "GLU": ("2345-7", "Glucose [Mass/volume] in Serum or Plasma"),
@@ -40,10 +43,23 @@ def transform(record, context):
         raise DataError(f"missing {', '.join(missing)}")
 
     code, display = record["code"], record.get("display") or None
-    if code.upper() in LOCAL_CODES:
-        code, display = LOCAL_CODES[code.upper()]
-    elif not LOINC.match(code):
-        raise DataError(f"test code {code!r} is neither LOINC nor in the local code table")
+    if LOINC.match(code):
+        # A LOINC code: when a terminology server is configured, it must know it,
+        # and its display wins over whatever the row says.
+        known = lookup(LOINC_SYSTEM, code)
+        if known:
+            display = known["display"] or display
+        elif has_code_system(LOINC_SYSTEM):
+            raise DataError(f"LOINC code {code!r} is not known to the terminology server")
+    else:
+        # A local code: the terminology server's ConceptMap first, the table here second.
+        mapped = translate(code, LOCAL_SYSTEM, LOINC_SYSTEM)
+        if mapped:
+            code, display = mapped["code"], mapped["display"] or display
+        elif code.upper() in LOCAL_CODES:
+            code, display = LOCAL_CODES[code.upper()]
+        else:
+            raise DataError(f"test code {code!r} is neither LOINC nor in the local code table")
 
     unit = record["unit"]
     if unit not in UCUM:

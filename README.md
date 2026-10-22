@@ -96,6 +96,8 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...) |
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
 | `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store |
+| `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
+| `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
 
 ### The store, and more than one instance
@@ -151,7 +153,12 @@ An **MLLP** source (`type: mllp`, see `sources/adt-mllp.yaml.example`) listens o
 `delivery.method` picks how a source's records reach HFS:
 
 - **`rest`** (default): the transform runs on every record and the resources go out in `batch` Bundles, one `PUT` per record, with a status per entry. For anything that needs a transform, and for feeds of hundreds to tens of thousands of records at a time.
-- **`bulk_submit`**: for data that already is FHIR with ids, such as an NDJSON export. No transform runs. The engine stores the rows for the history, predicts what HFS will refuse (no `resourceType`, no `id`), and hands the **source objects themselves** to HFS through a `$bulk-submit` manifest it serves at `{public_url}/bulk/{token}/manifest.json`: pre-signed URLs for S3 objects, the engine's own `/bulk/{token}/files/{n}` for folder files. One submission per drop (up to `manifest_objects_max` objects), with a `submissionId` derived from the files so a repeated drop is refused by HFS instead of ingested twice. The engine polls the status URL, reads HFS's receipts (`{"reference": "Type/id"}` per stored resource, an `OperationOutcome` per failure) and maps them to its records by `Type/id`. Objects stay at the source until the receipts are in, then they are archived. `url_ttl_seconds` bounds how long the URLs stay valid.
+- **`bulk_submit`**: HFS ingests through a `$bulk-submit` manifest the engine serves at `{public_url}/bulk/{token}/manifest.json`, polls the status URL, reads HFS's receipts (`{"reference": "Type/id"}` per stored resource, an `OperationOutcome` per failure) and maps them to its records by `Type/id`. What the manifest points at is `delivery.bulk_from`:
+  - `source_objects`: for data that already is FHIR with ids, such as an NDJSON export. No transform runs. The engine stores the rows for the history, predicts what HFS will refuse (no `resourceType`, no `id`), and hands the **source objects themselves** over: pre-signed URLs for S3 objects, the engine's own `/bulk/{token}/files/{n}` for folder files. One submission per drop (up to `manifest_objects_max` objects), with a `submissionId` derived from the files so a repeated drop is refused by HFS instead of ingested twice. Objects stay at the source until the receipts are in, then they are archived.
+  - `transformed`: for anything else, a lab CSV included. The transform runs as on the REST path; a resource that carries only an `identifier` gets an **`id` derived from it** (48 hex characters of SHA-256 over `system|value`), so `$bulk-submit`, which stores by id, updates the same resource every time the row is sent. The engine writes the resources as NDJSON per resource type, puts them in the source's own store when it can sign URLs (an S3 source: HFS fetches from the bucket, under `{archive_prefix}/submissions/{token}/`) or serves them itself from `bulk_dir`, and opens one submission per `bulk_records_max` records. The source file is archived as soon as it is read; the engine's files go once the receipts are in.
+  - `auto` (the default): `source_objects` for NDJSON or Bundle files with the passthrough transform, `transformed` otherwise.
+
+  `url_ttl_seconds` bounds how long the URLs stay valid.
 
 `public_url` in `hie.yaml` must be the URL HFS reaches the engine at.
 
@@ -189,6 +196,19 @@ def transform(record, context):
 - Every resource needs an `id` (delivered as `PUT Type/id`) or an `identifier` with system and value (delivered as `PUT Type?identifier=system|value`), so sending the same record twice updates instead of duplicating.
 - `DataError` rejects the row with its message. Any other exception is recorded with its traceback as a transform bug.
 - Data that already is FHIR (NDJSON exports, Bundle files) goes through `transforms/fhir_passthrough.py`. A Bundle is split into one record per entry, and references between entries (`urn:uuid:...`) are rewritten to `Type/id`.
+
+### Terminology
+
+With `terminology_url` in `hie.yaml` (or `HIE_TERMINOLOGY_SERVER`; `HIE_TERMINOLOGY_TOKEN` adds a bearer token) naming an HTS, a transform can ask the terminology server:
+
+```python
+from hie import DataError, lookup, translate
+
+known = lookup("http://loinc.org", code)                     # CodeSystem/$lookup: {"display": ...} or None
+mapped = translate(code, "urn:lab:north:codes", "http://loinc.org")  # ConceptMap/$translate: {"code", "display", "system"} or None
+```
+
+Answers are cached for the life of the worker. A code the server does not know is `None`, and the transform decides (usually a `DataError`); a server that cannot be reached raises `TerminologyError`, which the engine treats as **transient**: the record waits and is tried again, nothing is rejected. Without a server both helpers answer `None`, so a transform keeps a fallback or rejects. `transforms/lab_results.py` does both: a LOINC code must be known to the server when there is one, and takes its display from it; a local code goes through the server's ConceptMap first and the script's own table second.
 
 ## API
 
@@ -290,10 +310,10 @@ docs/           design decisions
 
 ```sh
 cargo test                                 # unit tests and the end-to-end tests
-python -m unittest tests/test_lab_results.py tests/test_hl7.py
+python -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store; the same source was run by hand against a MinIO (the `ghcr.io/coollabsio/minio` mirror HFS's CI pins) holding the Synthea export, on both delivery paths against an HFS that requires tokens: 632 resources by REST and the same 632 by `$bulk-submit` through pre-signed URLs, each resource stored once, objects archived under the processed prefix, and a re-uploaded file recognised as a duplicate. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/database_source.rs` covers the database source on SQLite: runs of the query past a cursor, the cursor moving once the rows are stored, nothing read twice, `cursor_start`, and the connection test; `tests/mssql_source.rs` runs the same source against a SQL Server when `HIE_TEST_MSSQL_URL` is set, and is skipped otherwise. `tests/leases.rs` puts two instances on one store: one runs the source, the other stands by, and takes over when the lease lapses. `tests/hl7v2.rs` covers HL7 v2: a file of messages through a folder source, and messages over MLLP spooled, acknowledged, delivered, and resent as duplicates; `tests/test_hl7.py` covers the Python helpers. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
+The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/bulk_submit.rs` drives both bulk paths against a stand-in consumer: an NDJSON export handed over as source objects, and a lab CSV transformed, given derived ids, written by the engine and settled by receipts. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store; the same source was run by hand against a MinIO (the `ghcr.io/coollabsio/minio` mirror HFS's CI pins) holding the Synthea export, on both delivery paths against an HFS that requires tokens: 632 resources by REST and the same 632 by `$bulk-submit` through pre-signed URLs, each resource stored once, objects archived under the processed prefix, and a re-uploaded file recognised as a duplicate. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/database_source.rs` covers the database source on SQLite: runs of the query past a cursor, the cursor moving once the rows are stored, nothing read twice, `cursor_start`, and the connection test; `tests/mssql_source.rs` runs the same source against a SQL Server when `HIE_TEST_MSSQL_URL` is set, and is skipped otherwise. `tests/leases.rs` puts two instances on one store: one runs the source, the other stands by, and takes over when the lease lapses. `tests/test_terminology.py` covers the terminology helpers against a stand-in HTS and the lab transform using them. `tests/hl7v2.rs` covers HL7 v2: a file of messages through a folder source, and messages over MLLP spooled, acknowledged, delivered, and resent as duplicates; `tests/test_hl7.py` covers the Python helpers. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
 
 They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.

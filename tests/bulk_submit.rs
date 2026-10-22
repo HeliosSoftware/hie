@@ -315,3 +315,151 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
         "done"
     );
 }
+
+/// A lab CSV through the transform and then `$bulk-submit`: the engine writes the
+/// Observations as NDJSON, gives each one an id derived from its identifier, serves
+/// the file, and maps the receipts back; the CSV itself is archived at once.
+#[tokio::test]
+async fn a_csv_is_transformed_and_submitted_in_bulk() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let consumer = Consumer {
+        base: Arc::default(),
+        submissions: Arc::default(),
+    };
+    let (hfs_listener, hfs_url) = bind().await;
+    *consumer.base.lock().unwrap() = hfs_url.clone();
+    let hfs = Router::new()
+        .route("/$bulk-submit", post(kickoff))
+        .route("/$bulk-submit-status", post(status_kickoff))
+        .route("/bulk-submit-status/{id}", get(poll))
+        .route("/bulk-submit-file/{id}/{part}", get(artifact))
+        .with_state(consumer.clone());
+    tokio::spawn(async move { axum::serve(hfs_listener, hfs).await.unwrap() });
+
+    let (hie_listener, hie_url) = bind().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {hfs_url}\npublic_url: {hie_url}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/labs.yaml"),
+        "id: labs\nname: Labs\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 60\n  min_file_age_ms: 0\n\
+         transform: transforms/lab_results.py\ndelivery:\n  method: bulk_submit\n  initial_backoff_ms: 10\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    assert!(
+        feeds[0].bulk_transformed(),
+        "a CSV with a transform takes the transformed path"
+    );
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("labs", None).unwrap();
+    let runner = manager.runner("labs").unwrap();
+    let db = state.db.clone();
+    let bulk_dir = state.bulk_dir.clone();
+    let router = hie::api::router(state);
+    tokio::spawn(async move { axum::serve(hie_listener, router).await.unwrap() });
+
+    let inbox = root.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::copy(
+        repo().join("examples/data/messy.csv"),
+        inbox.join("messy.csv"),
+    )
+    .unwrap();
+
+    // Pass 1: the transform runs (5 bad rows rejected with their reason), the good
+    // row gets a derived id, the engine writes and serves the NDJSON, HFS reads it.
+    runner.tick().await.unwrap();
+    let counts = db.feed_counts("labs").unwrap();
+    assert_eq!(
+        (counts["submitted"].as_i64(), counts["rejected"].as_i64()),
+        (Some(1), Some(5)),
+        "{counts}"
+    );
+    assert!(
+        !inbox.join("messy.csv").exists(),
+        "the CSV is archived at once; HFS never reads it"
+    );
+    let submitted = db
+        .query_json(
+            "SELECT resources FROM records WHERE status = 'submitted'",
+            [],
+        )
+        .unwrap();
+    let id = submitted[0]["resources"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(id.len(), 48, "{id}");
+    assert_eq!(
+        submitted[0]["resources"][0]["identifier"][0]["system"],
+        "urn:helios:hie:lab-results"
+    );
+    let token = db.query_json("SELECT token FROM submissions", []).unwrap()[0]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(bulk_dir.join(&token).join("1.ndjson").is_file());
+    {
+        let subs = consumer.submissions.lock().unwrap();
+        let sub = subs.values().next().expect("HFS received the submission");
+        assert_eq!(sub.references, [format!("Observation/{id}")]);
+        assert!(sub.errors.is_empty());
+    }
+
+    // Passes 2 and 3: the receipts arrive, the record is sent, the engine's file goes.
+    runner.tick().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    runner.tick().await.unwrap();
+    let counts = db.feed_counts("labs").unwrap();
+    assert_eq!(
+        (counts["sent"].as_i64(), counts["submitted"].as_i64()),
+        (Some(1), Some(0))
+    );
+    let sent = db
+        .query_json("SELECT response FROM records WHERE status = 'sent'", [])
+        .unwrap();
+    assert_eq!(
+        sent[0]["response"][0]["reference"],
+        format!("Observation/{id}")
+    );
+    assert!(
+        !bulk_dir.join(&token).exists(),
+        "served file removed after the receipts"
+    );
+
+    // The same row again, in another file, derives the same id: an update, not a duplicate.
+    std::fs::copy(
+        repo().join("examples/data/messy.csv"),
+        inbox.join("messy-again.csv"),
+    )
+    .unwrap();
+    std::fs::write(
+        inbox.join("messy-again.csv"),
+        "patient,code,display,value,unit,date\nPatient/3,GLU,,99,mg/dL,2026-10-16\n",
+    )
+    .unwrap();
+    runner.tick().await.unwrap();
+    let again = db
+        .query_json(
+            "SELECT resources FROM records WHERE status = 'submitted'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(again[0]["resources"][0]["id"], id);
+}

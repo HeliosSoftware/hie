@@ -49,6 +49,7 @@ pub fn build(
             manager,
             auth,
             started: api::Started::now(),
+            bulk_dir: config.bulk_dir(),
         },
     ))
 }

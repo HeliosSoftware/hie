@@ -123,3 +123,125 @@ def hl7_datetime(text):
         if zone:
             out += zone[:3] + ":" + zone[3:5]
     return out
+
+
+# ---- Terminology (HTS) -----------------------------------------------------
+#
+# When the engine names a terminology server (HIE_TERMINOLOGY_SERVER, set from
+# `terminology_url` in hie.yaml), a transform can check codes against it and
+# translate local codes through a ConceptMap. Without a server every call answers
+# None, so a transform must keep a fallback (a local table) or reject the row.
+#
+#   lookup("http://loinc.org", "2345-7")             -> {"display": "Glucose [Mass/volume] in Serum or Plasma", ...} or None
+#   translate("GLU", "urn:lab:north:codes", "http://loinc.org")
+#                                                     -> {"code": "2345-7", "display": "...", "system": "http://loinc.org"} or None
+#
+# Answers are cached for the life of the worker process.
+
+import json as _json
+import os as _os
+import urllib.error as _urlerror
+import urllib.parse as _urlparse
+import urllib.request as _urlrequest
+
+_cache = {}
+
+
+def terminology_server():
+    """The HTS base URL the engine configured, or None."""
+    url = _os.environ.get("HIE_TERMINOLOGY_SERVER", "").strip()
+    return url.rstrip("/") or None
+
+
+def _get(path, params):
+    base = terminology_server()
+    if not base:
+        return None
+    key = (path, tuple(sorted(params.items())))
+    if key in _cache:
+        return _cache[key]
+    url = f"{base}/{path}?{_urlparse.urlencode(params)}"
+    request = _urlrequest.Request(url, headers={"Accept": "application/fhir+json"})
+    token = _os.environ.get("HIE_TERMINOLOGY_TOKEN", "").strip()
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with _urlrequest.urlopen(request, timeout=10) as response:
+            body = _json.loads(response.read().decode("utf-8"))
+    except _urlerror.HTTPError as e:
+        if e.code in (400, 404, 422):
+            body = None
+        else:
+            raise TerminologyError(f"{url} answered {e.code}") from None
+    except (_urlerror.URLError, OSError, ValueError) as e:
+        raise TerminologyError(f"cannot reach the terminology server at {base}: {e}") from None
+    _cache[key] = body
+    return body
+
+
+class TerminologyError(Exception):
+    """The terminology server could not be used. Not a data error: the row is retried."""
+
+
+def _parameters(body):
+    out = {}
+    for p in (body or {}).get("parameter", []):
+        name = p.get("name")
+        value = next((v for k, v in p.items() if k.startswith("value")), None)
+        if value is not None and name not in out:
+            out[name] = value
+        if name == "match":
+            out.setdefault("match", []).append(p.get("part", []))
+    return out
+
+
+def lookup(system, code):
+    """`CodeSystem/$lookup`: the code's display and properties, or None when unknown."""
+    body = _get("CodeSystem/$lookup", {"system": system, "code": code})
+    if not body:
+        return None
+    params = _parameters(body)
+    if "display" not in params and "name" not in params:
+        return None
+    return {"system": system, "code": code, "display": params.get("display"), "name": params.get("name")}
+
+
+def translate(code, source_system, target_system, concept_map=None):
+    """`ConceptMap/$translate`: the first equivalent target concept, or None."""
+    params = {"system": source_system, "code": code, "targetsystem": target_system}
+    if concept_map:
+        params["url"] = concept_map
+    body = _get("ConceptMap/$translate", params)
+    if not body:
+        return None
+    parsed = _parameters(body)
+    if parsed.get("result") is not True:
+        return None
+    for parts in parsed.get("match", []):
+        concept = None
+        relationship = None
+        for part in parts:
+            if part.get("name") == "concept":
+                concept = part.get("valueCoding")
+            if part.get("name") in ("relationship", "equivalence"):
+                relationship = part.get("valueCode")
+        if concept and relationship not in ("not-related-to", "unmatched", "disjoint"):
+            return {"system": concept.get("system", target_system), "code": concept.get("code"), "display": concept.get("display")}
+    return None
+
+
+def has_code_system(system):
+    """Whether the terminology server holds a code system at all (`CodeSystem?url=`).
+
+    A server that lacks LOINC cannot say a LOINC code is wrong; a transform checks
+    this before treating an unknown code as a data error.
+    """
+    if not terminology_server():
+        return False
+    body = _get("CodeSystem", {"url": system, "_summary": "count"})
+    if not body:
+        return False
+    total = body.get("total")
+    if total is None:
+        return bool(body.get("entry"))
+    return total > 0

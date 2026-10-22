@@ -18,6 +18,10 @@ pub struct Config {
     pub public_url: String,
     #[serde(default = "default_python")]
     pub python: String,
+    /// The terminology server (HTS) transforms may ask through `lookup` and
+    /// `translate`; `HIE_TERMINOLOGY_SERVER` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminology_url: Option<String>,
     /// One YAML file per source. The engine writes here when a source is created
     /// through the API, so the definitions stay files under version control.
     #[serde(default = "default_sources_dir", alias = "feeds_dir")]
@@ -213,6 +217,31 @@ pub struct DeliveryConfig {
     /// Objects per manifest; a larger drop is split into several submissions.
     #[serde(default = "default_manifest_objects_max")]
     pub manifest_objects_max: usize,
+    /// What a `$bulk-submit` manifest points at. `source_objects`: the files as
+    /// they arrived, read by HFS straight from the source (FHIR NDJSON with ids,
+    /// no transform). `transformed`: the engine runs the transform, writes the
+    /// resources as NDJSON per resource type and hands those over; a resource
+    /// without an `id` gets one derived from its identifier. `auto` (default) is
+    /// `source_objects` for NDJSON or Bundle files with the passthrough transform
+    /// and `transformed` for everything else.
+    #[serde(default)]
+    pub bulk_from: BulkFrom,
+    /// Records per submission on the `transformed` path.
+    #[serde(default = "default_bulk_records_max")]
+    pub bulk_records_max: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkFrom {
+    #[default]
+    Auto,
+    SourceObjects,
+    Transformed,
+}
+
+fn default_bulk_records_max() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -233,6 +262,8 @@ impl Default for DeliveryConfig {
             alert_after_attempts: default_alert_after_attempts(),
             url_ttl_seconds: default_url_ttl_seconds(),
             manifest_objects_max: default_manifest_objects_max(),
+            bulk_from: BulkFrom::Auto,
+            bulk_records_max: default_bulk_records_max(),
         }
     }
 }
@@ -429,9 +460,11 @@ impl FeedConfig {
         };
         if let Some((kind, format)) = fixed {
             self.format = format;
-            if self.delivery.method == DeliveryMethod::BulkSubmit {
+            if self.delivery.method == DeliveryMethod::BulkSubmit
+                && self.delivery.bulk_from == BulkFrom::SourceObjects
+            {
                 bail!(
-                    "source {}: a {kind} source cannot deliver by bulk_submit (there is no file for HFS to fetch); use rest",
+                    "source {}: a {kind} source has no file for HFS to fetch; use bulk_from: transformed (the default) or rest",
                     self.id
                 );
             }
@@ -451,6 +484,44 @@ impl FeedConfig {
             .transpose()
             .with_context(|| format!("source {}: expect_every", self.id))?;
         Ok(())
+    }
+}
+
+impl Config {
+    /// Where the engine writes the NDJSON it serves for transformed submissions:
+    /// next to the SQLite file, or under `data/bulk` when the store is PostgreSQL.
+    pub fn bulk_dir(&self) -> PathBuf {
+        let spec = self.database.to_string_lossy();
+        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            self.base_dir.join("data").join("bulk")
+        } else {
+            self.database
+                .parent()
+                .map(|p| p.join("bulk"))
+                .unwrap_or_else(|| PathBuf::from("bulk"))
+        }
+    }
+}
+
+impl FeedConfig {
+    /// Whether `$bulk-submit` hands HFS the engine's transformed NDJSON rather
+    /// than the source objects.
+    pub fn bulk_transformed(&self) -> bool {
+        if self.delivery.method != DeliveryMethod::BulkSubmit {
+            return false;
+        }
+        match self.delivery.bulk_from {
+            BulkFrom::Transformed => true,
+            BulkFrom::SourceObjects => false,
+            BulkFrom::Auto => {
+                let passthrough = self
+                    .transform
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "fhir_passthrough.py");
+                !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && passthrough)
+            }
+        }
     }
 
     /// The source's YAML file, as submitted (paths as given, not resolved).
