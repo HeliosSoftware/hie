@@ -34,6 +34,11 @@ def load(path):
 
 
 def main():
+    # The protocol is UTF-8 whatever the locale says: on Windows Python would
+    # otherwise read the engine's UTF-8 as cp1252 and turn every accented letter
+    # into a lone surrogate that the engine cannot parse back.
+    sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+    sys.stdout.reconfigure(encoding="utf-8", errors="strict")
     protocol = sys.stdout
     sys.stdout = sys.stderr
     module = load(sys.argv[1])

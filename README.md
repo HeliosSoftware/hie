@@ -312,7 +312,7 @@ docs/           design decisions
 
 ```sh
 cargo test                                 # unit tests and the end-to-end tests
-python -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py
+python -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py tests/test_worker.py
 cargo clippy --all-targets -- -D warnings
 ```
 

@@ -59,7 +59,10 @@ impl Transformer {
         command
             .arg("-u")
             .arg(&self.worker_script)
-            .arg(&self.transform_script);
+            .arg(&self.transform_script)
+            // The protocol is UTF-8 on every platform, whatever the locale.
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1");
         if let Some(url) = &self.terminology {
             command.env("HIE_TERMINOLOGY_SERVER", url);
         }
@@ -105,8 +108,14 @@ impl Transformer {
         if worker.stdout.read_line(&mut line).await? == 0 {
             bail!("transform process exited");
         }
-        let reply: Value =
-            serde_json::from_str(&line).context("invalid reply from transform process")?;
+        // A reply that cannot be read is the transform's fault for this record,
+        // not the process's: the worker answered in order and stays; the record
+        // is rejected with the reason rather than tried again forever.
+        let reply: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => json!({"id": id, "error": {"kind": "transform",
+                "message": format!("the transform's reply could not be read as JSON ({e}); the resources it returned are not valid JSON")}}),
+        };
         if reply.get("id") != Some(&json!(id)) {
             bail!("transform reply out of order");
         }

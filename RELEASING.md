@@ -34,7 +34,7 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py
+python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py tests/test_worker.py
 HIE_TEST_PYTHON=python3 cargo test
 docker build -t hie:local . && docker run --rm hie:local check
 ```

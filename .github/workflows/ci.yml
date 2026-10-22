@@ -24,7 +24,7 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Transform tests
-        run: python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py
+        run: python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py tests/test_worker.py
       - name: Engine tests
         run: cargo test
         env:
