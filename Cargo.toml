@@ -41,6 +41,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 jsonwebtoken = "9"

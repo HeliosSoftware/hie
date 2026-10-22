@@ -59,9 +59,14 @@ impl Source {
                 pattern,
                 min_file_age_ms,
                 archive_prefix,
+                anonymous,
+                read_only,
                 ..
             } => {
                 let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+                if *anonymous {
+                    builder = builder.with_skip_signature(true);
+                }
                 if let Some(region) = region {
                     builder = builder.with_region(region);
                 }
@@ -76,16 +81,19 @@ impl Source {
                         .build()
                         .with_context(|| format!("feed {}: S3 source", feed.id))?,
                 );
-                Source::Object(
-                    ObjectSource::new(
-                        store.clone(),
-                        prefix,
-                        archive_prefix,
-                        pattern,
-                        Duration::from_millis(*min_file_age_ms),
-                    )
-                    .with_signer(store),
+                let source = ObjectSource::new(
+                    store.clone(),
+                    prefix,
+                    archive_prefix,
+                    pattern,
+                    Duration::from_millis(*min_file_age_ms),
                 )
+                .read_only(*read_only);
+                Source::Object(if *anonymous {
+                    source
+                } else {
+                    source.with_signer(store)
+                })
             }
             SourceConfig::Mllp { listen, spool, .. } => Source::Mllp(MllpSource {
                 feed_id: feed.id.clone(),
@@ -131,6 +139,11 @@ impl Source {
                 auth.as_ref(),
             )?),
         })
+    }
+
+    /// Whether objects stay where they are once taken (someone else's bucket).
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Source::Object(o) if o.read_only)
     }
 
     /// Starts whatever listens: the MLLP port. Other sources have nothing to
@@ -288,6 +301,8 @@ pub struct ObjectSource {
     archive: ObjectPath,
     pattern: String,
     min_age: TimeDelta,
+    /// Nothing is moved or written in the bucket.
+    read_only: bool,
 }
 
 impl ObjectSource {
@@ -306,7 +321,13 @@ impl ObjectSource {
             archive: ObjectPath::from(archive_prefix.trim_matches('/')),
             pattern: pattern.to_string(),
             min_age: TimeDelta::from_std(min_age).unwrap_or_default(),
+            read_only: false,
         }
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     async fn list(&self) -> Result<Vec<String>> {
@@ -352,6 +373,9 @@ impl ObjectSource {
     }
 
     async fn acknowledge(&self, key: &str, archived_name: &str) -> Result<String> {
+        if self.read_only {
+            return Ok(key.to_string());
+        }
         let to = ObjectPath::from(format!("{}/{archived_name}", self.archive));
         self.store
             .rename(&ObjectPath::from(key), &to)
@@ -385,7 +409,7 @@ impl Source {
         let Source::Object(o) = self else {
             return Ok(None);
         };
-        if o.signer.is_none() {
+        if o.signer.is_none() || o.read_only {
             return Ok(None);
         }
         let key = format!("{}/{name}", o.submission_prefix(token));

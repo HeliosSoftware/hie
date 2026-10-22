@@ -892,7 +892,7 @@ impl Db {
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
                     f.rejected_reported
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.feed_id = $1 AND f.status = 'processing'
+             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
              GROUP BY f.id, f.name, f.rejected_reported
              HAVING COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) = 0",
             &params![feed],

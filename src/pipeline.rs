@@ -10,7 +10,7 @@ use chrono::Timelike;
 
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
-use crate::config::{DeliveryMethod, FeedConfig, parse_duration};
+use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
@@ -251,6 +251,10 @@ impl FeedRunner {
         let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
+            if self.source.is_read_only() {
+                // Someone else's bucket: the object stays, and was already taken.
+                return Ok(());
+            }
             if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
                 // The same object, still waiting for HFS to fetch it: leave it alone.
                 return Ok(());
@@ -272,6 +276,10 @@ impl FeedRunner {
             return self.db.mark_file_archived(id, &archived);
         }
 
+        if name.to_ascii_lowercase().ends_with(".zip") {
+            return self.unpack(&key, &name, &sha, bytes).await;
+        }
+
         // On the bulk path the object stays at its source until HFS has read it.
         let keep = self.bulk.is_some() && !self.bulk_transformed;
         let file_id = self.db.insert_file(
@@ -283,26 +291,7 @@ impl FeedRunner {
             None,
             keep.then_some(key.as_str()),
         )?;
-        let readable = match reader::read(self.feed.format, &bytes) {
-            Ok(records) => {
-                let rows: Vec<_> = records
-                    .into_iter()
-                    .map(|r| (r.line, r.raw, r.parse_error))
-                    .collect();
-                self.db.insert_records(file_id, feed, &rows)?;
-                tracing::info!(feed, file = %name, records = rows.len(), "received");
-                true
-            }
-            Err(e) => {
-                self.db.fail_file(file_id, &format!("{e:#}"))?;
-                self.alerts.raise(
-                    Some(feed),
-                    "unreadable_file",
-                    &format!("{}: cannot read {name}: {e:#}", self.feed.name),
-                )?;
-                false
-            }
-        };
+        let readable = self.admit(file_id, &name, &bytes)?;
         if keep && readable {
             return Ok(());
         }
@@ -311,6 +300,123 @@ impl FeedRunner {
             .acknowledge(&key, &format!("{file_id}-{name}"))
             .await?;
         self.db.mark_file_archived(file_id, &archived)
+    }
+
+    /// Reads a file's records into the store; `false` when the file could not be read.
+    fn admit(&self, file_id: i64, name: &str, bytes: &[u8]) -> Result<bool> {
+        let feed = &self.feed.id;
+        match reader::read(self.feed.format, bytes) {
+            Ok(records) => {
+                let rows: Vec<_> = records
+                    .into_iter()
+                    .map(|r| (r.line, r.raw, r.parse_error))
+                    .collect();
+                self.db.insert_records(file_id, feed, &rows)?;
+                tracing::info!(feed, file = %name, records = rows.len(), "received");
+                Ok(true)
+            }
+            Err(e) => {
+                self.db.fail_file(file_id, &format!("{e:#}"))?;
+                self.alerts.raise(
+                    Some(feed),
+                    "unreadable_file",
+                    &format!("{}: cannot read {name}: {e:#}", self.feed.name),
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// A zip is a drop of several files: every entry whose extension fits the
+    /// source's format becomes a load of its own, named `drop.zip!/entry`; the
+    /// zip is recorded as `unpacked` (so it is not read twice) and archived.
+    async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
+        let feed = &self.feed.id;
+        let container =
+            self.db
+                .insert_file(feed, name, sha, bytes.len() as u64, "unpacked", None, None)?;
+        let wanted = match self.feed.format {
+            Format::Csv => &["csv"][..],
+            Format::Ndjson => &["ndjson", "jsonl"][..],
+            Format::FhirBundle => &["json"][..],
+            Format::Hl7v2 => &["hl7", "txt"][..],
+        };
+        let entries =
+            match tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<u8>)>> {
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+                let mut out = Vec::new();
+                for i in 0..archive.len() {
+                    let mut entry = archive.by_index(i)?;
+                    if entry.is_dir() {
+                        continue;
+                    }
+                    let path = entry.name().to_string();
+                    let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+                    if base.starts_with('.') || path.starts_with("__MACOSX") {
+                        continue;
+                    }
+                    let mut data = Vec::with_capacity(entry.size() as usize);
+                    std::io::Read::read_to_end(&mut entry, &mut data)?;
+                    out.push((path, data));
+                }
+                Ok(out)
+            })
+            .await?
+            {
+                Ok(entries) => entries,
+                Err(e) => {
+                    self.db.fail_file(container, &format!("{e:#}"))?;
+                    self.alerts.raise(
+                        Some(feed),
+                        "unreadable_file",
+                        &format!("{}: cannot open {name}: {e:#}", self.feed.name),
+                    )?;
+                    let archived = self
+                        .source
+                        .acknowledge(key, &format!("{container}-{name}"))
+                        .await?;
+                    return self.db.mark_file_archived(container, &archived);
+                }
+            };
+        let mut taken = 0;
+        for (path, data) in entries {
+            let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if !wanted.contains(&extension.as_str()) {
+                tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {:?} file", self.feed.format);
+                continue;
+            }
+            let entry_name = format!("{name}!/{path}");
+            let entry_sha = reader::sha256_hex(&data);
+            if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
+                self.db.insert_file(
+                    feed,
+                    &entry_name,
+                    &entry_sha,
+                    data.len() as u64,
+                    "duplicate",
+                    Some(original),
+                    None,
+                )?;
+                continue;
+            }
+            let file_id = self.db.insert_file(
+                feed,
+                &entry_name,
+                &entry_sha,
+                data.len() as u64,
+                "processing",
+                None,
+                None,
+            )?;
+            self.admit(file_id, &entry_name, &data)?;
+            taken += 1;
+        }
+        tracing::info!(feed, file = %name, entries = taken, "unpacked");
+        let archived = self
+            .source
+            .acknowledge(key, &format!("{container}-{name}"))
+            .await?;
+        self.db.mark_file_archived(container, &archived)
     }
 
     async fn transform_received(&self) -> Result<()> {

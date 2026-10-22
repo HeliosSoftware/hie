@@ -357,6 +357,17 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:** `$validate-code` against a ValueSet, `$expand`, and `$subsumes` are not wrapped; the cache is per worker process and forgets on restart; a token for HTS is a single static one, not the engine's client credentials.
 
+## 31. Zips are drops of several files; a bucket may be read without being touched
+
+**Chosen:** A zip on a file source is unpacked by the engine: every entry whose extension fits the source's format becomes a load of its own (`drop.zip!/path`), with its own hash, records and dispositions; the other entries are skipped; the zip is recorded as `unpacked` and archived. An S3 source may be `anonymous` (unsigned requests to a public bucket) and `read_only` (nothing moved or written; an object already taken is recognised by its content on later passes and skipped without a duplicate row).
+
+**Why:**
+- The first real drop the engine was given was a public bucket holding zips: a customer's export tool writes zips, and a data provider's bucket is not ours to move things in. Asking people to unzip and copy first is the kind of step an integration engine exists to remove.
+- One load per entry keeps the traceability the engine promises: a bad line is named by file and line inside the zip, and a resent zip whose entries are unchanged is all duplicates.
+- Read-only is a property of the source, not of the engine: `acknowledge` becomes a no-op and content hashes do the remembering, so every other part of the pipeline is unchanged.
+
+**Cost / not yet:** entries are unpacked in memory, one at a time, so a zip of several gigabytes needs streaming, not yet written; nested zips and tar/gzip are not handled; on a read-only bucket the engine re-downloads an unchanged zip every pass to hash it (object ETags would avoid that).
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

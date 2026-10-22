@@ -96,6 +96,13 @@ pub enum SourceConfig {
         min_file_age_ms: u64,
         #[serde(default = "default_archive_prefix")]
         archive_prefix: String,
+        /// A public bucket: no credentials, requests are not signed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        anonymous: bool,
+        /// Someone else's bucket: nothing is moved or written there. Objects the
+        /// engine has already taken are recognised by content and left alone.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read_only: bool,
     },
     /// Another FHIR server, pulled by `_lastUpdated`: each pass takes what changed
     /// since the last one, per resource type, and hands it on as NDJSON.
