@@ -161,7 +161,11 @@ def _get(path, params):
     if key in _cache:
         return _cache[key]
     url = f"{base}/{path}?{_urlparse.urlencode(params)}"
-    request = _urlrequest.Request(url, headers={"Accept": "application/fhir+json"})
+    # A named client: the default Python agent is refused by some front doors.
+    request = _urlrequest.Request(
+        url,
+        headers={"Accept": "application/fhir+json", "User-Agent": "hie (+https://github.com/HeliosSoftware/hie)"},
+    )
     token = _os.environ.get("HIE_TERMINOLOGY_TOKEN", "").strip()
     if token:
         request.add_header("Authorization", f"Bearer {token}")
