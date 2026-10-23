@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS records (
   submission TEXT
 );
 CREATE INDEX IF NOT EXISTS records_feed_status ON records(feed_id, status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS records_feed_status_id ON records(feed_id, status, id);
 CREATE INDEX IF NOT EXISTS records_file ON records(file_id);
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY,
