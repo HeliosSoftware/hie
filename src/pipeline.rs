@@ -834,6 +834,9 @@ impl FeedRunner {
                     // An unpacked entry the engine served: nothing to move, it goes.
                     if let Err(e) = std::fs::remove_file(&key) {
                         tracing::warn!(feed = %self.feed.id, "cannot remove {key}: {e}");
+                    } else if let Some(dir) = Path::new(&key).parent() {
+                        // The container's directory goes with its last entry.
+                        let _ = std::fs::remove_dir(dir);
                     }
                     format!("removed {key}")
                 } else {

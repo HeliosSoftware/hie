@@ -483,6 +483,9 @@ impl Source {
         let Source::Object(o) = self else {
             return Ok(());
         };
+        if o.read_only {
+            return Ok(());
+        }
         let prefix = ObjectPath::from(o.submission_prefix(token));
         let mut stream = o.store.list(Some(&prefix));
         let mut keys = Vec::new();
