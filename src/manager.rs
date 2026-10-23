@@ -12,10 +12,11 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use crate::alerts::Alerter;
-use crate::config::{Config, FeedConfig, SourceConfig};
+use crate::config::{Config, FeedConfig, RuntimeConfig, SourceConfig};
 use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
+use crate::runtime::RuntimeSettings;
 use crate::source::{Probe, Source};
 use crate::transform::{Outcome, Transformer, check_resource};
 
@@ -49,6 +50,8 @@ pub struct SourceManager {
     base_dir: PathBuf,
     bulk_dir: PathBuf,
     terminology_url: Option<String>,
+    /// The shared runtime transforms run at, when configured.
+    runtime: Option<RuntimeSettings>,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     alerts: Arc<Alerter>,
@@ -73,6 +76,11 @@ impl SourceManager {
             base_dir: config.base_dir.clone(),
             bulk_dir: config.bulk_dir(),
             terminology_url: config.terminology_url.clone(),
+            runtime: config
+                .runtime
+                .as_ref()
+                .filter(|r| !r.url.trim().is_empty())
+                .map(RuntimeConfig::settings),
             db,
             fhir,
             alerts,
@@ -94,7 +102,8 @@ impl SourceManager {
                 &self.public_url,
             )?
             .with_bulk_dir(&self.bulk_dir)
-            .with_terminology(self.terminology_url.as_deref()),
+            .with_terminology(self.terminology_url.as_deref())
+            .with_runtime(self.runtime.as_ref()),
         );
         let control = Arc::new(RunnerControl::default());
         tokio::spawn(runner.clone().run(control.clone()));
@@ -414,13 +423,23 @@ impl SourceManager {
         }
         let mut transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
         transformer.set_terminology(self.terminology_url.as_deref());
+        transformer.set_runtime(self.runtime.as_ref());
+        let items: Vec<(Value, Value)> = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                (
+                    record.clone(),
+                    json!({"feed": "try", "file": "try", "line": i + 1}),
+                )
+            })
+            .collect();
+        let outcomes = transformer
+            .try_many(&items)
+            .await
+            .map_err(|e| ManagerError::Invalid(format!("transform failed to run: {e:#}")))?;
         let mut out = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            let context = json!({"feed": "try", "file": "try", "line": i + 1});
-            let outcome = transformer
-                .transform(record, &context)
-                .await
-                .map_err(|e| ManagerError::Invalid(format!("transform failed to run: {e:#}")))?;
+        for (record, outcome) in records.iter().zip(outcomes) {
             out.push(match outcome {
                 Outcome::Rejected { kind, message } => {
                     json!({"record": record, "error": {"kind": kind, "message": message}})

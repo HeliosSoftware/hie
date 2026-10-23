@@ -1,0 +1,21 @@
+# Rename to .yaml to enable. A bucket that announces new objects through an SQS
+# queue: the bucket's s3:ObjectCreated:* notifications go to the queue (directly
+# or through SNS), and each pass reads the queue instead of listing the bucket.
+# The queue is read with the same AWS credentials as the bucket, and the bucket
+# is still listed in full at start and every relist_seconds.
+id: drops-sqs
+name: Lab drops announced by SQS
+source:
+  type: s3
+  bucket: my-lab-feeds
+  prefix: drops/
+  pattern: "*.csv"
+  queue: https://sqs.us-east-1.amazonaws.com/123456789012/my-lab-feeds-drops
+  relist_seconds: 3600
+  poll_seconds: 5
+  archive_prefix: drops-processed
+format: csv
+transform: transforms/lab_results.py
+delivery:
+  batch_size: 200
+expect_every: 24h

@@ -49,6 +49,12 @@ async fn main() -> Result<()> {
     {
         config.terminology_url = Some(url);
     }
+    if let Some(url) = std::env::var("HIE_RUNTIME_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        config.runtime.get_or_insert_with(Default::default).url = url;
+    }
     let runtime_dir = std::env::var_os("HIE_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

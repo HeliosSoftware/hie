@@ -22,6 +22,10 @@ pub struct Config {
     /// `translate`; `HIE_TERMINOLOGY_SERVER` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminology_url: Option<String>,
+    /// The shared Python runtime transforms run at, instead of a local process;
+    /// `HIE_RUNTIME_URL` overrides its URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
     /// One YAML file per source. The engine writes here when a source is created
     /// through the API, so the definitions stay files under version control.
     #[serde(default = "default_sources_dir", alias = "feeds_dir")]
@@ -34,6 +38,48 @@ pub struct Config {
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
+}
+
+/// The shared Python runtime (python-runtime's HIE facade).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    pub url: String,
+    /// The environment variable holding the consumer's bearer token.
+    #[serde(default = "default_runtime_token_env")]
+    pub token_env: String,
+    /// Requests per call; the runtime partitions them further itself.
+    #[serde(default = "default_runtime_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token_env: default_runtime_token_env(),
+            batch_size: default_runtime_batch_size(),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// What a transformer needs: the URL and the token read from the environment now.
+    pub fn settings(&self) -> crate::runtime::RuntimeSettings {
+        crate::runtime::RuntimeSettings {
+            url: self.url.clone(),
+            token: std::env::var(&self.token_env)
+                .ok()
+                .filter(|t| !t.trim().is_empty()),
+            batch_size: self.batch_size,
+        }
+    }
+}
+
+fn default_runtime_token_env() -> String {
+    "HIE_RUNTIME_TOKEN".into()
+}
+fn default_runtime_batch_size() -> usize {
+    200
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -103,6 +149,13 @@ pub enum SourceConfig {
         /// engine has already taken are recognised by content and left alone.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         read_only: bool,
+        /// An SQS queue the bucket's `s3:ObjectCreated:*` notifications go to.
+        /// With one, a pass reads the queue instead of listing the bucket; the
+        /// bucket is still listed at start and every `relist_seconds`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue: Option<String>,
+        #[serde(default = "default_relist_seconds")]
+        relist_seconds: u64,
     },
     /// Another FHIR server, pulled by `_lastUpdated`: each pass takes what changed
     /// since the last one, per resource type, and hands it on as NDJSON.
@@ -297,6 +350,9 @@ fn default_transforms_dir() -> PathBuf {
 fn default_pattern() -> String {
     "*".into()
 }
+fn default_relist_seconds() -> u64 {
+    3600
+}
 fn default_poll_seconds() -> u64 {
     5
 }
@@ -418,6 +474,25 @@ impl SourceConfig {
             && listen.parse::<std::net::SocketAddr>().is_err()
         {
             bail!("mllp: listen must be an address such as 0.0.0.0:2575, not {listen:?}");
+        }
+        if let SourceConfig::S3 {
+            queue: Some(queue),
+            anonymous,
+            relist_seconds,
+            ..
+        } = self
+        {
+            if !(queue.starts_with("http://") || queue.starts_with("https://")) {
+                bail!("s3: queue must be the SQS queue URL, not {queue:?}");
+            }
+            if *anonymous {
+                bail!(
+                    "s3: a queue is read with credentials; anonymous and queue do not go together"
+                );
+            }
+            if *relist_seconds == 0 {
+                bail!("s3: relist_seconds must be at least 1");
+            }
         }
         Ok(())
     }

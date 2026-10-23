@@ -16,6 +16,10 @@ use crate::config::{FeedConfig, RemoteAuth, SourceConfig, glob_match};
 use crate::credentials::{CredentialSettings, Credentials, TokenSource};
 use crate::database::DatabaseSource;
 use crate::db::Db;
+use crate::sqs::SqsQueue;
+
+/// Notices taken from a queue in one pass.
+const NOTICES_PER_PASS: usize = 1000;
 
 /// One object fetched from a source: a file, an S3 object.
 pub struct Incoming {
@@ -61,6 +65,8 @@ impl Source {
                 archive_prefix,
                 anonymous,
                 read_only,
+                queue,
+                relist_seconds,
                 ..
             } => {
                 // Objects of hundreds of megabytes take minutes to fetch.
@@ -86,7 +92,7 @@ impl Source {
                         .build()
                         .with_context(|| format!("feed {}: S3 source", feed.id))?,
                 );
-                let source = ObjectSource::new(
+                let mut source = ObjectSource::new(
                     store.clone(),
                     prefix,
                     archive_prefix,
@@ -94,6 +100,16 @@ impl Source {
                     Duration::from_millis(*min_file_age_ms),
                 )
                 .read_only(*read_only);
+                if let Some(queue) = queue {
+                    let region = SqsQueue::region_of(queue)
+                        .or_else(|| region.clone())
+                        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                        .or_else(|| std::env::var("AWS_REGION").ok())
+                        .unwrap_or_else(|| "us-east-1".into());
+                    source = source
+                        .with_queue(SqsQueue::new(queue, &region, store.credentials().clone()))
+                        .relist_every(Duration::from_secs(*relist_seconds));
+                }
                 Source::Object(if *anonymous {
                     source
                 } else {
@@ -149,6 +165,15 @@ impl Source {
     /// Whether objects stay where they are once taken (someone else's bucket).
     pub fn is_read_only(&self) -> bool {
         matches!(self, Source::Object(o) if o.read_only)
+    }
+
+    /// Acknowledges the notifications behind the objects a pass took; nothing
+    /// to do for sources without a queue.
+    pub async fn settle_notifications(&self) -> Result<()> {
+        match self {
+            Source::Object(o) => o.settle_notifications().await,
+            _ => Ok(()),
+        }
     }
 
     /// Starts whatever listens: the MLLP port. Other sources have nothing to
@@ -326,6 +351,13 @@ pub struct ObjectSource {
     min_age: TimeDelta,
     /// Nothing is moved or written in the bucket.
     read_only: bool,
+    /// Where the bucket announces new objects; without one every pass lists.
+    queue: Option<SqsQueue>,
+    /// How often the bucket is listed anyway when a queue announces objects.
+    relist: Duration,
+    last_listed: std::sync::Mutex<Option<Instant>>,
+    /// Messages whose objects this pass took, deleted once the pass is through.
+    receipts: std::sync::Mutex<Vec<String>>,
 }
 
 impl ObjectSource {
@@ -345,12 +377,84 @@ impl ObjectSource {
             pattern: pattern.to_string(),
             min_age: TimeDelta::from_std(min_age).unwrap_or_default(),
             read_only: false,
+            queue: None,
+            relist: Duration::from_secs(3600),
+            last_listed: std::sync::Mutex::new(None),
+            receipts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
+    }
+
+    /// Reads new objects from the bucket's notification queue instead of
+    /// listing on every pass.
+    pub fn with_queue(mut self, queue: SqsQueue) -> Self {
+        self.queue = Some(queue);
+        self
+    }
+
+    /// With a queue, how often the bucket is still listed in full.
+    pub fn relist_every(mut self, every: Duration) -> Self {
+        self.relist = every;
+        self
+    }
+
+    /// Whether a key is one this source takes: under its prefix, not archived,
+    /// named by its pattern.
+    fn wants(&self, key: &str) -> bool {
+        if let Some(prefix) = &self.prefix
+            && !key.starts_with(&format!("{prefix}/"))
+        {
+            return false;
+        }
+        if key.starts_with(&format!("{}/", self.archive)) {
+            return false;
+        }
+        key.rsplit('/')
+            .next()
+            .is_some_and(|name| glob_match(&self.pattern, name))
+    }
+
+    /// What the queue announced since the last pass, as `list_meta` shapes it.
+    async fn announced(&self, queue: &SqsQueue) -> Result<Vec<(String, String, u64)>> {
+        let notices = queue.receive(NOTICES_PER_PASS).await?;
+        let mut keys = Vec::new();
+        let mut receipts = Vec::with_capacity(notices.len());
+        for notice in notices {
+            receipts.push(notice.receipt);
+            if !self.wants(&notice.key) {
+                continue;
+            }
+            let name = notice
+                .key
+                .rsplit('/')
+                .next()
+                .unwrap_or("object")
+                .to_string();
+            keys.push((notice.key, name, notice.size.unwrap_or(0)));
+        }
+        self.receipts.lock().expect("receipts").extend(receipts);
+        keys.sort();
+        keys.dedup_by(|a, b| a.0 == b.0);
+        Ok(keys)
+    }
+
+    /// Deletes the notifications of the objects a finished pass took.
+    async fn settle_notifications(&self) -> Result<()> {
+        let Some(queue) = &self.queue else {
+            return Ok(());
+        };
+        let receipts = std::mem::take(&mut *self.receipts.lock().expect("receipts"));
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        queue
+            .delete(&receipts)
+            .await
+            .context("acknowledging notifications")
     }
 
     async fn list(&self) -> Result<Vec<String>> {
@@ -362,8 +466,26 @@ impl ObjectSource {
             .collect())
     }
 
-    /// Every object the source would take: key, file name and size.
+    /// Every object the source would take: key, file name and size. With a
+    /// queue, what it announced, except at start and every `relist` when the
+    /// bucket is listed in full so nothing announced badly is missed for good.
     async fn list_meta(&self) -> Result<Vec<(String, String, u64)>> {
+        if let Some(queue) = &self.queue {
+            let listing_due = self
+                .last_listed
+                .lock()
+                .expect("last_listed")
+                .is_none_or(|at| at.elapsed() >= self.relist);
+            if !listing_due {
+                return self.announced(queue).await;
+            }
+        }
+        let listed = self.list_all().await?;
+        *self.last_listed.lock().expect("last_listed") = Some(Instant::now());
+        Ok(listed)
+    }
+
+    async fn list_all(&self) -> Result<Vec<(String, String, u64)>> {
         let archive_prefix = format!("{}/", self.archive);
         let mut stream = self.store.list(self.prefix.as_ref());
         let mut keys = Vec::new();

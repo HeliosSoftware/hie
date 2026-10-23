@@ -368,6 +368,41 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:** entries are unpacked in memory, one at a time, so a zip of several gigabytes needs streaming, not yet written; nested zips and tar/gzip are not handled; on a read-only bucket the engine re-downloads an unchanged zip every pass to hash it (object ETags would avoid that).
 
+## 32. Transform and delivery overlap on the REST path
+
+**Chosen:** A pass transforms and delivers concurrently: the transform loop signals after each chunk of 200 records, and a delivery loop sends what is due in batch Bundles as soon as it is signalled, finishing with one last sweep when the transform ends. Both run on the pass's own task (`tokio::join!`), not in threads.
+
+**Why:**
+- With a large CSV the two slow parts are Python and HFS, and each was idle while the other worked: the file took the sum of the two. Interleaving brings it to about the longer of the two, with no change to what is stored or how a failure is handled.
+- The store already orders the work (`received` → `pending` → `sent`), so delivery needs no queue of its own: it simply asks for what is due, as it did after the transform.
+- Delivery during an HFS outage behaves as before: deferred records carry a backoff and are not due, so the delivery loop does not hammer a server that is down.
+
+**Cost / not yet:** the tail of a file goes out in smaller Bundles than `batch_size`; the bulk path still transforms the whole load before the submission opens, because a manifest names complete files.
+
+## 33. A bucket may announce objects through an SQS queue
+
+**Chosen:** An S3 source may name a `queue`: the SQS queue the bucket's `s3:ObjectCreated:*` notifications go to, directly or through SNS. With one, a pass receives the queue's messages, takes the announced objects that are under the prefix and match the pattern, and deletes the messages once the objects are in the store. The bucket is still listed in full at start and every `relist_seconds` (an hour by default). The queue is read with the source's own AWS credentials, signed with the SigV4 signer the S3 client already carries; no AWS SDK is added.
+
+**Why:**
+- Listing a bucket of many objects every few seconds is slow and costs a request per thousand keys; a queue delivers only what is new, at once.
+- Messages are deleted after the pass, not when received, so a crash or a failed fetch leaves them to be delivered again after the visibility timeout; a duplicate delivery is harmless because the store recognises the object by its hash.
+- The periodic listing is the safety net for a lost or malformed event, which S3's at-least-once delivery does not rule out.
+- Signing the SQS calls with the credential provider from `object_store` keeps one way of holding AWS credentials and avoids the AWS SDK's weight for two API calls (`ReceiveMessage`, `DeleteMessageBatch`).
+
+**Cost / not yet:** an anonymous source cannot have a queue; FIFO queues and message attributes are not handled; the queue must be the bucket's own notification target (the engine does not subscribe or configure anything); MinIO cannot feed a real queue, so the lab runs this only against the stand-in.
+
+## 34. Transforms may run at the shared Python runtime
+
+**Chosen:** `runtime:` in `hie.yaml` (URL, the environment variable holding the consumer's token, records per call) makes every transform run at python-runtime through its HIE facade: the code is stored under the file's name once per version (`PUT /transforms/{name}`, verified by the sha256 the runtime answers), each chunk is one `POST /transforms/{name}/run` and each reply is the worker's own line, parsed as the local worker's output is. Try uses `POST /transforms/try`. A `404 transform_unknown` stores the code again and retries once; any other non-200 leaves the records received for the next pass, with the facade's status explained in the log.
+
+**Why:**
+- The runtime exists now and is the agreed place for customer code (discussion #3): a sandbox per attempt, a budget, no network, whereas the local worker runs any script with the engine's own rights.
+- The facade speaks HIE's own envelope, so the engine's outcome handling, rejection kinds and traces are unchanged; the backend is a switch in the configuration, not a different pipeline.
+- Storing by sha avoids a `PUT` per pass, and comparing the runtime's digest catches a store that holds something else under the name.
+- Records never move on a runtime failure: the facade's non-200 answers mean nothing ran (its ADR 0003), so keeping the batch received and retrying is exact, not optimistic.
+
+**Cost / not yet:** no backoff on `503 Retry-After` beyond the poll interval, and no runtime outage alert yet (the facade's ADR 0006 items 2 and 4); terminology helpers answer `None` in the sandbox, so a transform that needs HTS runs locally; one oversize record (over 8 MiB) fails its whole batch and is retried every pass; authentication is the runtime's development token, JWT later.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.
@@ -375,5 +410,4 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Code translation through HTS (`ConceptMap/$translate`) inside transforms.
 - Patient matching (source identifier to `Patient` reference).
 - Authentication to HFS with a private-key JWT (SMART backend services); client credentials are in.
-- `$bulk-submit` delivery (HFS fetches a manifest and NDJSON files, which can live on S3).
 - A UI, FHIR Mapping Language, record-level parallelism within one source.

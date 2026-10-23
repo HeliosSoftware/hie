@@ -14,8 +14,10 @@ use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
+use crate::runtime::RuntimeSettings;
 use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
+use tokio::sync::Notify;
 
 const TRANSFORM_CHUNK: usize = 200;
 /// Records settled per page when a submission's receipts come back.
@@ -165,6 +167,12 @@ impl FeedRunner {
         self
     }
 
+    /// The shared runtime the transform runs at, instead of a local process.
+    pub fn with_runtime(mut self, settings: Option<&RuntimeSettings>) -> Self {
+        self.transformer.set_runtime(settings);
+        self
+    }
+
     /// How long a pass may hold the source before another instance may take it:
     /// a few polls, and never less than half a minute.
     fn lease_ttl_ms(&self) -> i64 {
@@ -228,15 +236,14 @@ impl FeedRunner {
         }
         if self.bulk.is_some() {
             if self.bulk_transformed {
-                self.transform_received().await?;
+                self.transform_received(None).await?;
             } else {
                 self.preflight_received()?;
             }
             self.submit_pending().await?;
             self.poll_submissions().await?;
         } else {
-            self.transform_received().await?;
-            self.deliver_due().await?;
+            self.transform_and_deliver().await?;
         }
         self.finish()?;
         self.check_silence()?;
@@ -251,10 +258,46 @@ impl FeedRunner {
             if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
                 continue;
             }
-            let incoming = self.source.fetch(&key).await?;
+            let incoming = match self.source.fetch(&key).await {
+                Ok(incoming) => incoming,
+                // Announced, then gone before this pass reached it: nothing to take.
+                Err(e) if is_not_found(&e) => {
+                    tracing::warn!(feed = %self.feed.id, key, "object no longer there, skipped");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             self.ingest(incoming).await?;
         }
+        // Notifications are acknowledged only once what they announced is in the
+        // store: a pass that failed before this leaves them to be delivered again.
+        self.source.settle_notifications().await?;
         Ok(())
+    }
+
+    /// Transforms and delivers at the same time: HFS takes each transformed
+    /// batch while Python works on the next, instead of after the whole file.
+    async fn transform_and_deliver(&self) -> Result<()> {
+        let progress = Notify::new();
+        let done = AtomicBool::new(false);
+        let transform = async {
+            let result = self.transform_received(Some(&progress)).await;
+            done.store(true, Ordering::SeqCst);
+            progress.notify_one();
+            result
+        };
+        let deliver = async {
+            loop {
+                self.deliver_due().await?;
+                if done.load(Ordering::SeqCst) {
+                    return self.deliver_due().await;
+                }
+                progress.notified().await;
+            }
+        };
+        let (transformed, delivered) = tokio::join!(transform, deliver);
+        transformed?;
+        delivered
     }
 
     async fn ingest(&self, incoming: Incoming) -> Result<()> {
@@ -450,22 +493,31 @@ impl FeedRunner {
         self.db.mark_file_archived(container, &archived)
     }
 
-    async fn transform_received(&self) -> Result<()> {
+    /// Transforms what was received, a chunk at a time; `progress` is told after
+    /// each chunk so delivery can start on it.
+    async fn transform_received(&self, progress: Option<&Notify>) -> Result<()> {
         loop {
             let items = self.db.received_records(&self.feed.id, TRANSFORM_CHUNK)?;
             if items.is_empty() {
                 return Ok(());
             }
-            for item in &items {
-                let context =
-                    json!({"feed": self.feed.id, "file": item.file_name, "line": item.line});
-                let outcome = match self.transformer.transform(&item.raw, &context).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        tracing::error!(feed = %self.feed.id, "transform process unavailable, will retry: {e:#}");
-                        return Ok(());
-                    }
-                };
+            let requests: Vec<(Value, Value)> = items
+                .iter()
+                .map(|item| {
+                    (
+                        item.raw.clone(),
+                        json!({"feed": self.feed.id, "file": item.file_name, "line": item.line}),
+                    )
+                })
+                .collect();
+            let outcomes = match self.transformer.transform_many(&requests).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::error!(feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
+                    return Ok(());
+                }
+            };
+            for (item, outcome) in items.iter().zip(outcomes) {
                 match outcome {
                     Outcome::Transient(message) => {
                         // Not the row's fault: leave it and the rest for the next pass.
@@ -505,6 +557,9 @@ impl FeedRunner {
                         }
                     }
                 }
+            }
+            if let Some(progress) = progress {
+                progress.notify_one();
             }
         }
     }
@@ -1155,4 +1210,16 @@ pub fn human(d: Duration) -> String {
         7200..=172_799 => format!("{}h", s / 3600),
         _ => format!("{}d", s / 86_400),
     }
+}
+
+/// Whether an error from a source says the object is not there any more.
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<object_store::Error>(),
+            Some(object_store::Error::NotFound { .. })
+        ) || cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
