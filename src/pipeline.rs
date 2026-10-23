@@ -506,11 +506,10 @@ impl FeedRunner {
             if items.is_empty() {
                 return Ok(());
             }
+            let mut good = Vec::with_capacity(items.len());
             for item in &items {
                 match transform::check_resource(&item.raw) {
-                    Ok(DeliveryKey::Id { .. }) => self
-                        .db
-                        .mark_transformed(item.id, &Value::Array(vec![item.raw.clone()]))?,
+                    Ok(DeliveryKey::Id { .. }) => good.push(item.id),
                     Ok(DeliveryKey::Identifier { resource_type, .. }) => self.db.mark_rejected(
                         item.id,
                         "validation",
@@ -520,6 +519,7 @@ impl FeedRunner {
                     Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
                 }
             }
+            self.db.mark_passthrough(&good)?;
         }
     }
 

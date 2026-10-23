@@ -197,6 +197,9 @@ pub struct Lease {
     pub until: i64,
 }
 
+/// Rows per multi-row statement: well under both engines' parameter limits.
+const INSERT_ROWS_PER_STATEMENT: usize = 200;
+
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -938,16 +941,29 @@ impl Db {
             c.batch("BEGIN")?;
             let now = now_ms();
             let result = (|| {
-                for (line, raw, parse_error) in rows {
-                    let (status, kind) = match parse_error {
-                        Some(_) => ("rejected", Some("parse")),
-                        None => ("received", None),
-                    };
-                    c.execute(
-                        "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        &params![file_id, feed, line, raw.to_string(), status, kind, parse_error, now],
-                    )?;
+                // Rows go in by the hundred per statement: one round trip each
+                // over a million rows is an hour; this is minutes.
+                for chunk in rows.chunks(INSERT_ROWS_PER_STATEMENT) {
+                    let mut sql = String::from(
+                        "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
+                    );
+                    let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
+                    for (i, (line, raw, parse_error)) in chunk.iter().enumerate() {
+                        let (status, kind) = match parse_error {
+                            Some(_) => ("rejected", Some("parse")),
+                            None => ("received", None),
+                        };
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        let b = i * 8;
+                        sql.push_str(&format!(
+                            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                            b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8
+                        ));
+                        values.extend(params![file_id, feed, line, raw.to_string(), status, kind, parse_error, now]);
+                    }
+                    c.execute(&sql, &values)?;
                 }
                 Ok::<_, anyhow::Error>(())
             })();
@@ -994,6 +1010,28 @@ impl Db {
              ORDER BY r.id LIMIT $3",
             &params![feed, now_ms(), limit],
         )
+    }
+
+    /// Marks records whose source row is the resource to deliver as transformed,
+    /// in one statement per hundreds of ids: the resource list is built from the
+    /// row in the store, so no payload travels.
+    pub fn mark_passthrough(&self, ids: &[i64]) -> Result<()> {
+        let now = now_ms();
+        for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let marks: Vec<String> = (0..chunk.len()).map(|i| format!("${}", i + 2)).collect();
+            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() + 1);
+            values.push(Param::Int(now));
+            values.extend(chunk.iter().map(|id| Param::Int(*id)));
+            self.execute(
+                &format!(
+                    "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
+                            attempts = 0, next_attempt_at = 0, updated_at = $1 WHERE id IN ({})",
+                    marks.join(", ")
+                ),
+                &values,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn mark_transformed(&self, id: i64, resources: &Value) -> Result<()> {
