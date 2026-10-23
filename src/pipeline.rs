@@ -18,6 +18,8 @@ use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
 
 const TRANSFORM_CHUNK: usize = 200;
+/// Records settled per page when a submission's receipts come back.
+const SETTLE_PAGE: usize = 5_000;
 
 /// How the manager drives a running feed: `poke` makes it pass now, `stopped` ends it.
 #[derive(Default)]
@@ -219,7 +221,11 @@ impl FeedRunner {
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
-        self.scan().await?;
+        // A source that cannot be read this pass must not hold back what is
+        // already in the store: the rest of the pass runs, the scan is retried next.
+        if let Err(e) = self.scan().await {
+            tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+        }
         if self.bulk.is_some() {
             if self.bulk_transformed {
                 self.transform_received().await?;
@@ -238,7 +244,13 @@ impl FeedRunner {
     }
 
     async fn scan(&self) -> Result<()> {
-        for key in self.source.list().await? {
+        let read_only = self.source.is_read_only();
+        for (key, name, size) in self.source.list_meta().await? {
+            // Someone else's bucket keeps what we took: known by name and size,
+            // it is not downloaded again just to recognise its hash.
+            if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
+                continue;
+            }
             let incoming = self.source.fetch(&key).await?;
             self.ingest(incoming).await?;
         }
@@ -542,7 +554,8 @@ impl FeedRunner {
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut entries = Vec::new();
-            let mut record_ids = Vec::new();
+            let mut file_ids = Vec::new();
+            let mut records = 0usize;
             let mut hashes = Vec::new();
             for file in &files {
                 let url = match &file.source_key {
@@ -555,28 +568,22 @@ impl FeedRunner {
                     }
                     _ => bulk.file_url(&token, file.file_id),
                 };
-                let resource_type = file
-                    .records
-                    .iter()
-                    .map(|(_, rt)| rt.as_str())
-                    .find(|rt| !rt.is_empty())
-                    .unwrap_or("Resource")
-                    .to_string();
-                entries.push((resource_type, url, file.records.len()));
-                record_ids.extend(file.records.iter().map(|(id, _)| *id));
+                entries.push((file.resource_type.clone(), url, file.count));
+                file_ids.push(file.file_id);
+                records += file.count;
                 hashes.push(file.name.clone());
             }
             let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission(
+            self.db.create_submission_for_files(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
-                &record_ids,
+                &file_ids,
             )?;
-            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records = record_ids.len(), "submission opened");
+            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records, "submission opened");
         }
     }
 
@@ -692,23 +699,36 @@ impl FeedRunner {
             0 => String::new(),
             n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
         };
-        for (record_id, _, resources) in self.db.submitted_records(token)? {
-            let reference = resources
-                .get(0)
-                .and_then(|r| transform::check_resource(r).ok())
-                .map(|key| fhir::request_url(&key));
-            match reference {
-                Some(r) if references.contains(&r) => {
-                    self.db
-                        .mark_sent(record_id, &json!([{"reference": r, "via": "$bulk-submit"}]))?;
-                }
-                _ => self.db.mark_rejected(
-                    record_id,
-                    "server",
-                    &format!("no receipt from HFS for this resource.{hint}"),
-                    None,
-                )?,
+        // Page through the submission: a large one holds a million records, and
+        // each page's receipts are applied in sets.
+        let mut after_id = 0;
+        loop {
+            let page = self
+                .db
+                .submitted_records_after(token, after_id, SETTLE_PAGE)?;
+            if page.is_empty() {
+                break;
             }
+            let mut sent = Vec::with_capacity(page.len());
+            for (record_id, _, resources) in &page {
+                let reference = resources
+                    .get(0)
+                    .and_then(|r| transform::check_resource(r).ok())
+                    .map(|key| fhir::request_url(&key));
+                match reference {
+                    Some(r) if references.contains(&r) => {
+                        sent.push((*record_id, json!([{"reference": r, "via": "$bulk-submit"}])))
+                    }
+                    _ => self.db.mark_rejected(
+                        *record_id,
+                        "server",
+                        &format!("no receipt from HFS for this resource.{hint}"),
+                        None,
+                    )?,
+                }
+                after_id = *record_id;
+            }
+            self.db.mark_sent_many(&sent)?;
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;

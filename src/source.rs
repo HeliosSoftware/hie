@@ -63,7 +63,12 @@ impl Source {
                 read_only,
                 ..
             } => {
-                let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+                // Objects of hundreds of megabytes take minutes to fetch.
+                let mut builder = AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_client_options(
+                        object_store::ClientOptions::new().with_timeout(Duration::from_secs(1800)),
+                    );
                 if *anonymous {
                     builder = builder.with_skip_signature(true);
                 }
@@ -182,6 +187,24 @@ impl Source {
                 Source::Database(d)
             }
             other => other,
+        }
+    }
+
+    /// What a pass would take, with each object's name and size, so a source
+    /// that is never moved (read-only) can be skipped without downloading what
+    /// was already taken. Sources without sizes answer 0.
+    pub async fn list_meta(&self) -> Result<Vec<(String, String, u64)>> {
+        match self {
+            Source::Object(o) => o.list_meta().await,
+            other => Ok(other
+                .list()
+                .await?
+                .into_iter()
+                .map(|k| {
+                    let name = k.rsplit(['/', '\\']).next().unwrap_or(&k).to_string();
+                    (k, name, 0)
+                })
+                .collect()),
         }
     }
 
@@ -331,6 +354,16 @@ impl ObjectSource {
     }
 
     async fn list(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_meta()
+            .await?
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect())
+    }
+
+    /// Every object the source would take: key, file name and size.
+    async fn list_meta(&self) -> Result<Vec<(String, String, u64)>> {
         let archive_prefix = format!("{}/", self.archive);
         let mut stream = self.store.list(self.prefix.as_ref());
         let mut keys = Vec::new();
@@ -349,7 +382,7 @@ impl ObjectSource {
             if Utc::now().signed_duration_since(meta.last_modified) < self.min_age {
                 continue;
             }
-            keys.push(key);
+            keys.push((key, name.to_string(), meta.size as u64));
         }
         keys.sort();
         Ok(keys)

@@ -165,8 +165,10 @@ pub struct SubmittableFile {
     pub file_id: i64,
     pub name: String,
     pub source_key: Option<String>,
-    /// (record id, resource type) for every pending record of the file.
-    pub records: Vec<(i64, String)>,
+    /// The resource type of the file's first pending record (an export holds one type per file).
+    pub resource_type: String,
+    /// Pending records of the file that no submission holds.
+    pub count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -778,6 +780,17 @@ impl Db {
 
     // ---- files -------------------------------------------------------------
 
+    /// Whether a file of this name and size was already taken (not as a duplicate):
+    /// what lets a read-only source be skipped without downloading it again.
+    pub fn has_file(&self, feed: &str, name: &str, size: u64) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM files WHERE feed_id = $1 AND name = $2 AND size = $3 AND status <> 'duplicate' LIMIT 1",
+                &params![feed, name, size],
+            )?
+            .is_some())
+    }
+
     pub fn find_file_by_hash(&self, feed: &str, sha: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
@@ -1058,6 +1071,39 @@ impl Db {
         .map(drop)
     }
 
+    /// Marks many records sent, each with its own response, in one statement per
+    /// hundreds of records: `UPDATE ... FROM (VALUES ...)`, which both engines
+    /// take with the columns named `column1` and `column2`.
+    pub fn mark_sent_many(&self, items: &[(i64, Value)]) -> Result<()> {
+        let now = now_ms();
+        for chunk in items.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let rows: Vec<String> = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                        i * 2 + 2,
+                        i * 2 + 3
+                    )
+                })
+                .collect();
+            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 1);
+            values.push(Param::Int(now));
+            for (id, response) in chunk {
+                values.push(Param::Int(*id));
+                values.push(Param::Text(response.to_string()));
+            }
+            self.execute(
+                &format!(
+                    "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL, updated_at = $1
+                     FROM (VALUES {}) AS v WHERE records.id = v.column1",
+                    rows.join(", ")
+                ),
+                &values,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn mark_sent(&self, id: i64, response: &Value) -> Result<()> {
         self.execute(
             "UPDATE records SET status = 'sent', response = $2, error_kind = NULL, error = NULL, updated_at = $3 WHERE id = $1",
@@ -1099,41 +1145,41 @@ impl Db {
 
     // ---- submissions ($bulk-submit) ------------------------------------------
 
-    /// Files of a feed with pending records that no submission holds yet.
+    /// Files of a feed with pending records that no submission holds yet, as the
+    /// manifest needs them: counted in the store, never listed record by record.
     pub fn submittable_files(&self, feed: &str, limit: usize) -> Result<Vec<SubmittableFile>> {
         let rows = self.query(
-            "SELECT r.id, r.file_id, f.name, f.source_key, r.resources
+            "SELECT r.file_id, f.name, f.source_key, COUNT(*)
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL
-             ORDER BY r.file_id, r.id",
-            &params![feed],
+             GROUP BY r.file_id, f.name, f.source_key
+             ORDER BY r.file_id LIMIT $2",
+            &params![feed, limit],
         )?;
-        let mut files: Vec<SubmittableFile> = Vec::new();
+        let mut files = Vec::with_capacity(rows.len());
         for r in &rows {
-            let (record_id, file_id) = (r.i64(0), r.i64(1));
-            let resource_type = r
-                .json(4)
+            let file_id = r.i64(0);
+            let resource_type = self
+                .query_one(
+                    "SELECT resources FROM records
+                     WHERE file_id = $1 AND status = 'pending' AND submission IS NULL ORDER BY id LIMIT 1",
+                    &params![file_id],
+                )?
+                .and_then(|row| row.json(0))
                 .and_then(|v| {
                     v.get(0)
-                        .and_then(|r| r.get("resourceType"))
+                        .and_then(|res| res.get("resourceType"))
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 })
-                .unwrap_or_default();
-            match files.last_mut() {
-                Some(f) if f.file_id == file_id => f.records.push((record_id, resource_type)),
-                _ => {
-                    if files.len() >= limit {
-                        break;
-                    }
-                    files.push(SubmittableFile {
-                        file_id,
-                        name: r.string(2),
-                        source_key: r.opt_string(3),
-                        records: vec![(record_id, resource_type)],
-                    });
-                }
-            }
+                .unwrap_or_else(|| "Resource".to_string());
+            files.push(SubmittableFile {
+                file_id,
+                name: r.string(1),
+                source_key: r.opt_string(2),
+                resource_type,
+                count: r.i64(3) as usize,
+            });
         }
         Ok(files)
     }
@@ -1151,6 +1197,44 @@ impl Db {
             .iter()
             .map(|r| (r.i64(0), r.json(1).unwrap_or(Value::Null)))
             .collect())
+    }
+
+    /// Opens a submission over every pending record of the given files, which move
+    /// to `submitted` in one statement per file.
+    pub fn create_submission_for_files(
+        &self,
+        token: &str,
+        feed: &str,
+        submission_id: &str,
+        manifest: &Value,
+        file_ids: &[i64],
+    ) -> Result<()> {
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let now = now_ms();
+            let result = (|| {
+                c.execute(
+                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
+                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
+                    &params![token, feed, submission_id, manifest.to_string(), now, now],
+                )?;
+                for file_id in file_ids {
+                    c.execute(
+                        "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
+                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
+                        &params![token, now, file_id, feed],
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            match result {
+                Ok(()) => c.batch("COMMIT"),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// Opens a submission over the given records, which move to `submitted`.
@@ -1253,10 +1337,22 @@ impl Db {
 
     /// The records a submission holds: (record id, file id, resources).
     pub fn submitted_records(&self, token: &str) -> Result<Vec<(i64, i64, Value)>> {
+        self.submitted_records_after(token, 0, usize::MAX)
+    }
+
+    /// A page of a submission's records past `after_id`, so a million-record
+    /// submission is settled in chunks rather than held in memory at once.
+    pub fn submitted_records_after(
+        &self,
+        token: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, i64, Value)>> {
         Ok(self
             .query(
-                "SELECT id, file_id, resources FROM records WHERE submission = $1 AND status = 'submitted' ORDER BY id",
-                &params![token],
+                "SELECT id, file_id, resources FROM records
+                 WHERE submission = $1 AND status = 'submitted' AND id > $2 ORDER BY id LIMIT $3",
+                &params![token, after_id, limit.min(i64::MAX as usize) as i64],
             )?
             .iter()
             .map(|r| (r.i64(0), r.i64(1), r.json(2).unwrap_or(Value::Null)))
