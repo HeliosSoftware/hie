@@ -1,339 +1,58 @@
+[![Helios Integration Engine](https://github.com/HeliosSoftware/hie/blob/main/github-banner.png)](https://heliossoftware.com)
+
 # Helios Integration Engine
 
-Gets data from sources into HFS, the Helios FHIR Server:
-- **Sources:** a folder or an S3 bucket today; databases and other FHIR servers later. Created and managed through the API, persisted as YAML files.
-- **Formats:** CSV, NDJSON, FHIR Bundle files.
-- **Transforms:** in Python.
-- **Delivery:** idempotent, with retries.
-- **Around it:** per-record traceability, an API for client UIs, Prometheus metrics, and alerts that include "this source went quiet".
+The Helios Integration Engine (HIE) moves healthcare data into [HL7® FHIR®](https://hl7.org/fhir): lab CSVs, HL7 v2 messages, SQL databases, S3 drops and other FHIR servers in, FHIR resources delivered to the [Helios FHIR Server](https://github.com/HeliosSoftware/hfs) out, with every row accounted for. It is written in Rust, and transforms are written in Python.
 
-The engine is a Rust service that runs on Linux (see the `Dockerfile`; CI builds and tests it on Ubuntu). This is a working prototype. The reasons behind each choice are in [docs/decisions.md](docs/decisions.md); the architecture is discussed in [the architectural discussion](https://github.com/HeliosSoftware/hie/discussions/1), the choice of stack in [discussion #2](https://github.com/HeliosSoftware/hie/discussions/2), and the shared runtime for user code in [discussion #3](https://github.com/HeliosSoftware/hie/discussions/3).
+## Why HIE?
 
-## What the prototype does
+- **🧾 Every row accounted for**: each record is stored before its file is acknowledged, and keeps its file, line, outcome and reason; nothing is lost when a server is down, and a bad row is rejected on its own with the line and the reason
+- **🔁 Idempotent delivery**: resources go out by id or by business identifier, so a re-sent file updates instead of duplicating; large loads go through `$bulk-submit` and are settled by receipts
+- **🐍 Transforms in Python**: a function that takes one record and returns resources, with terminology lookups against a FHIR terminology server; run locally or in a sandboxed shared runtime
+- **📡 Sources that fit what customers have**: folders, S3 buckets (public, read-only, or announced by SQS), SQL databases, HL7 v2 over MLLP, other FHIR servers; zips unpacked as drops
+- **🔔 Operable**: alert rules for silence, missing deliveries, rejected shares and unreachable servers; Prometheus metrics; an API with scopes behind any OIDC provider; several instances on one store
 
-Run against a real HFS (SQLite) with the example lab source:
+## What People Build with HIE
 
-| Scenario | Result |
-|---|---|
-| **1.** HFS is down when `labs.csv` arrives | The 3 rows are stored as `pending` and the file leaves the inbox. Each row shows why it is waiting. |
-| **2.** HFS comes back | The next retry delivers all 3. Nothing is lost. |
-| **3.** The identical file arrives again | Recognized by its SHA-256 and not reprocessed. |
-| **3.** The same rows arrive in a new file | Sent as conditional updates. HFS still has 3 `Observation`s; the re-sent one is at `versionId` 2. |
-| **4.** `messy.csv`: one good row (local code `GLU`) and five bad ones | The good row is mapped to LOINC and delivered. The five are rejected, each with its line and reason: `value 'alto' is not a number`, `expected 6 columns ... found 7`, `unit 'mmHg' has no UCUM mapping`, `test code 'XYZ' is neither LOINC nor in the local code table`, `date '16/10/2026' is not YYYY-MM-DD`. One alert for the file. |
-| **5.** The `alto` row is corrected and reprocessed through the API | Delivered (`201 Created`). The record keeps both the original and the corrected value. |
-| **6.** No data within `expect_every` | One `silence` alert, not one per check (covered by the integration test). |
+- **Lab and device feeds into a FHIR server**: CSV or HL7 v2 results becoming `Observation`s with LOINC codes
+- **Migrations**: another FHIR server or a bulk export loaded into HFS, by the million
+- **Registries and warehouses**: SQL tables pulled by a cursor and delivered as FHIR
+- **Customer drops**: files landing in a bucket, taken, transformed, delivered and archived without anyone watching
 
-And with Synthea output for three patients, in both of its FHIR shapes:
+# Quick Start
 
-| Source | Input | Result |
-|---|---|---|
-| `fhir_bundle` | 3 transaction Bundles (394 to 700 entries each, `urn:uuid` references between entries) | 1,775 resources delivered by id, 0 rejected. References rewritten to `Type/id`. |
-| `ndjson` | 17 files, one per resource type, from Synthea's bulk-data export | 1,775 resources delivered, 0 rejected. |
-| Both together | The same patients twice, in two formats | HFS holds each resource once: 3 `Patient`, 214 `Encounter`, 415 `Observation`. Both sources finished in 17 s on a laptop, Python transform included. |
+A public sandbox runs the latest release at `https://hie.heliossoftware.com` (`/health`, `/api`).
 
-## Run it
+With Docker, against a FHIR server on your machine:
 
-You need:
-- Rust 1.90 or later;
-- Python 3.8 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it);
-- HFS running at the URL in `hie.yaml` (default `http://localhost:8080`), with its search parameters loaded (`HFS_DATA_DIR`): a row delivered by business identifier is a conditional `PUT Type?identifier=...`, which HFS refuses with `400` when it does not know `identifier` for that type, and the engine then rejects the row as a data error.
-
-```sh
-cargo run -- check          # validate hie.yaml and sources/
-cargo run                   # run every source, serve the API on 127.0.0.1:8090
-cp examples/data/labs.csv inbox/lab-results/
-curl localhost:8090/api/sources
-```
-
-### In Docker
-
-Each release publishes a public Linux x86_64 image to `ghcr.io/heliossoftware/hie` (tags `:{version}`, `:{major.minor}`, `:latest`; see [Release and deploy](#release-and-deploy)). The image holds the engine, Python 3, `hie_runtime/`, and the example `transforms/` and `sources/` under `/hie`.
-
-The `hie.yaml` baked into the image listens on `0.0.0.0:8090`, so `docker run -p 8090:8090 ghcr.io/heliossoftware/hie:latest` serves the API, but it expects HFS at `localhost:8080`, which inside a container is the container itself. To deliver anywhere, mount your own config. To run HIE and HFS side by side on one Docker network:
-
-```sh
-mkdir -p inbox/lab-results data
-cat > hie.docker.yaml <<'EOF'
-fhir_base_url: http://hfs:8080   # HFS as this container sees it
-public_url: http://hie:8090      # HIE as HFS sees it (for $bulk-submit)
-database: data/hie.db
-listen: 0.0.0.0:8090             # all interfaces, so -p can reach it
-sources_dir: sources
-transforms_dir: transforms
-EOF
-
-docker network create hie-net
-docker run -d --name hfs --network hie-net -p 8080:8080 ghcr.io/heliossoftware/hfs:latest
-docker run -d --name hie --network hie-net -p 8090:8090 \
-  -v $PWD/hie.docker.yaml:/hie/hie.yaml:ro \
-  -v $PWD/inbox:/hie/inbox \
-  -v $PWD/data:/hie/data \
+```bash
+docker run --rm -p 8090:8090 \
+  -v $PWD/hie.yaml:/hie/hie.yaml:ro \
+  -v $PWD/sources:/hie/sources -v $PWD/transforms:/hie/transforms \
   ghcr.io/heliossoftware/hie:latest
-
-curl localhost:8090/health                        # {"status":"ok","service":"hie","version":...}
-cp examples/data/labs.csv inbox/lab-results/      # picked up within 5 s
-curl localhost:8090/api/sources/lab-results       # records.sent: 3
-curl 'localhost:8080/Observation?_summary=count'  # total: 3
 ```
 
-If HFS runs on the host instead, drop `--network`, use `fhir_base_url: http://host.docker.internal:8080`, and add `--add-host=host.docker.internal:host-gateway` on Linux.
+From source, with Rust 1.90+ and Python 3.8+:
 
-| Mount | Holds |
-|---|---|
-| `/hie/hie.yaml` | the engine configuration (required, see above) |
-| `/hie/inbox` | the folders the example folder sources watch; processed files move to `processed/` |
-| `/hie/data` | the SQLite store: records, delivery state, alerts. Without it, history is lost with the container |
-| `/hie/sources`, `/hie/transforms` | optional: your own sources and transforms, and anything created through the API, kept across upgrades |
-
-Other commands: `docker run --rm ghcr.io/heliossoftware/hie:latest --version`, and `... check` with the same mounts to validate the config and sources. The container runs as root, so files it writes to the mounts are owned by root. Pass the `HIE_AUTH_*` variables (see [Authentication](#authentication)) and AWS credentials with `-e`.
-
-To build the image yourself: `docker build -t hie .`
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `HIE_CONFIG` | `hie.yaml` | Engine configuration file |
-| `HIE_RUNTIME_DIR` | `hie_runtime` next to the config | Location of the Python worker |
-| `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...) |
-| `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
-| `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store |
-| `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
-| `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
-| `HIE_RUNTIME_URL` | `runtime.url` in `hie.yaml` | The shared Python runtime transforms run at, instead of a local process (see [Transforms](#transforms)) |
-| `HIE_RUNTIME_TOKEN` | | The consumer's bearer token for that runtime (`runtime.token_env` names another variable) |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
-
-### The store, and more than one instance
-
-`database:` in `hie.yaml` is where the engine keeps files, records, alerts, rules, cursors and leases: a SQLite file (the default, `data/hie.db`, no setup) or a `postgres://` URL. The SQL is the same on both; the test suite runs on either (`HIE_TEST_DATABASE_URL=postgres://... cargo test` runs every test on PostgreSQL, each in a schema of its own).
-
-With PostgreSQL, several instances may share one store. A source is run by the instance that holds its **lease**: each pass takes or renews it for three poll intervals (at least 30 s); another instance that finds it held stands by; when the holder dies, its lease lapses and the next pass elsewhere takes the source over, with the cursors, pause state and rules it left in the store. A clean stop releases the lease at once. `GET /api/sources/{id}` shows `lease` (owner, until, whether it is this instance's) and `instance`, and reports a source held elsewhere as `standby`. `POST .../check-now` reaches the instance it was sent to, so send it to the holder.
-
-## Sources
-
-A source is one connection: where the data comes from, its format, the transform that turns it into FHIR, how it is delivered, and how often data is expected. Each source is one YAML file in `sources/`, which the engine reads at start and **writes when a source is created or replaced through the API**, so definitions stay under version control either way.
-
-```yaml
-id: lab-results
-name: Lab results
-source:
-  type: folder               # or s3 (see sources/synthea-s3.yaml.example)
-  path: inbox/lab-results
-  pattern: "*.csv"
-  poll_seconds: 5
-format: csv                  # csv (default), ndjson, or fhir_bundle
-transform: transforms/lab_results.py
-delivery:
-  batch_size: 100            # entries per batch Bundle
-  initial_backoff_ms: 2000   # doubles per failed attempt, up to 5 minutes
-  alert_after_attempts: 5
-expect_every: 24h            # the silence rule the source is born with
+```bash
+cargo run -- check      # validate hie.yaml and sources/
+cargo run               # API on http://127.0.0.1:8090
 ```
 
-An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO. `anonymous: true` reads a public bucket without credentials (requests are not signed, so no pre-signed URLs either), and `read_only: true` is for someone else's bucket: nothing is moved or written there, and an object the engine has already taken is recognised by its name and size, then by its content, and left alone on later passes.
+Then drop `examples/data/labs.csv` into `inbox/lab-results/` and watch `GET /api/sources/lab-results`. The configuration, the environment variables and the Docker setup are in [Running HIE](docs/running.md).
 
-With a **notification queue** (`queue:` the URL of an SQS queue the bucket's `s3:ObjectCreated:*` events go to, directly or through SNS) a pass reads the queue instead of listing the bucket: only the announced objects are fetched, and their messages are deleted once the objects are in the store, so a pass that fails leaves them to be delivered again. The bucket is still listed in full at start and every `relist_seconds` (default 3600), so an object whose event was lost is taken within the hour rather than never. The queue is read with the source's own AWS credentials (SigV4), so `anonymous` and `queue` do not go together; the region comes from the queue URL. The queue's visibility timeout should exceed a pass over the largest drop.
+# Documentation
 
-A **zip** that arrives on any file source is a drop of several files: every entry whose extension fits the source's format (`.csv`, `.ndjson`/`.jsonl`, `.json` for Bundles, `.hl7`) becomes a load of its own, named `drop.zip!/path/inside`; the other entries (a manifest, a README, a CSV in an NDJSON drop) are skipped. The zip is recorded as `unpacked`, archived like any file, and not read twice. Entries are unpacked in memory, so a zip should hold a few hundred megabytes at most. On the `source_objects` bulk path HFS cannot read a zip, so each unpacked entry is **staged** where HFS can fetch it: in the source's own store under `{archive_prefix}/unpacked/` when the store can be written and can sign URLs, otherwise under the engine's `bulk_dir`, served at `/bulk/{token}/files/{n}`; staged entries go once the receipts are in.
+- [Running HIE](docs/running.md) — binary, Docker, environment, the store and several instances
+- [Sources](docs/sources.md) — folder, S3, SQS, FHIR server, database, HL7 v2 over MLLP; formats; zips; delivery methods; alert rules
+- [Transforms](docs/transforms.md) — the Python contract, terminology, where transforms run
+- [API and authentication](docs/api.md) — the HTTP API, scopes, the engine's identity towards HFS
+- [Development, tests, release](docs/development.md) — layout, test suites, releasing to the sandbox
+- [What the engine does, shown](docs/prototype-results.md) — scenarios against a real HFS
+- [Decisions](docs/decisions.md) — the reasons behind each design choice
+- [Discussions](https://github.com/HeliosSoftware/hie/discussions) — the architecture (#1), the stack (#2), the shared Python runtime (#3)
+- [Roadmap](ROADMAP.md)
 
-A **FHIR server** source (`type: fhir_server`, see `sources/other-fhir.yaml.example`) pulls another server into HFS: it names the server's `url`, the resource `types` to pull, and optionally `since` (a FHIR instant to start from) and `auth` (`method: client_credentials` with `token_url`, `client_id`, `client_secret_env`, or `method: bearer` with `token_env`; secrets are read from the named environment variable, never written in the file). Each pass searches every type for `_lastUpdated=gt{cursor}` sorted by `_lastUpdated`, `page_size` per page and up to `max_pages` pages, and hands the resources on as one NDJSON load per type; the cursor moves to the newest `meta.lastUpdated` once the records are stored, so a crash repeats a page rather than losing it. The format is `ndjson` whatever the file says, resources go out by their id, and `bulk_submit` is refused. The connection test reads `/metadata` and counts what waits past each cursor.
+# License
 
-A **database** source (`type: database`, see `sources/lab-database.yaml.example` and `transforms/sql_lab_results.py`) reads a SQL database with the operator's own query: `url_env` names the environment variable holding the connection URL (`postgres://`, `mysql://`, `sqlserver://` or `sqlite:`; the URL carries the password, so it is never in the file), `query` is the SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`, and `cursor_column` is the column the cursor follows. Prefer a **unique, increasing column** such as an id: with an updated-at column, rows that share one timestamp (a multi-row `INSERT` gets a single `now()`) and fall on both sides of a `LIMIT` are never read, because the next run asks for values strictly past the cursor; the engine logs a warning when a whole run shares one cursor value. Each pass binds the cursor as a parameter, runs the query up to `max_runs` times moving the cursor between runs, and hands the rows on as one NDJSON load; each row reaches the transform as a JSON object with the database's types (numbers, ISO timestamps, JSON). The cursor keeps its kind (integer, float, timestamp, date, text) and moves to the largest value seen once the records are stored. `cursor_start` says where to begin the first time. PostgreSQL is the target; MySQL/MariaDB and SQLite go through the same code (the tests run on SQLite), and **SQL Server** through its own driver with the same definition: `sqlserver://user:password@host:1433/database?encrypt=on&trust_cert=true` (`mssql://` too; `encrypt` is on by default, `trust_cert=true` accepts a self-signed certificate; the placeholder is bound as `@P1`, and a `TOP n` plays the part of `LIMIT`). SQL Server authentication only; Windows authentication is not supported. The connection test connects and runs the query once past the cursor.
-
-### HL7 v2
-
-`format: hl7v2` reads a file of HL7 v2 messages (one or more, each starting at its `MSH`; segments separated by `\r`, `\n` or `\r\n`) into one record per message. The record is a JSON object the transform reads without parsing pipes:
-
-```json
-{"message_type": "ADT^A01", "control_id": "MSG0001", "sending_application": "LAB", "sending_facility": "NORTH",
- "receiving_application": "HIE", "receiving_facility": "HFS", "version": "2.5.1",
- "segments": [{"name": "MSH", "fields": ["|", "^~\\&", "LAB", ...]}, {"name": "PID", "fields": ["1", "", "12345^^^NORTH^MR", "", "Doe^Jane^M", ...]}],
- "text": "MSH|^~\\&|LAB|..."}
-```
-
-Fields keep their separators; the helpers in `hie_runtime/hie.py` split them: `hl7(record, "PID-5.1")` (segment, field, component; `PID-3[2].1` for a repetition, `OBX(3)-5` for the third OBX), `hl7_segments(record, "OBX")`, `hl7_field(segment, "5.1")`, and `hl7_datetime("20261021120000")` for an HL7 timestamp as a FHIR `dateTime`. `transforms/hl7_adt_patient.py` turns an ADT A01/A04/A08/A28/A31 into a `Patient` delivered as a conditional update on the MRN in `PID-3`.
-
-An **MLLP** source (`type: mllp`, see `sources/adt-mllp.yaml.example`) listens on `listen` (e.g. `0.0.0.0:2575`) for MLLP-framed messages. Every message is parsed, written to `spool` as its own file (written, fsynced, renamed), and **only then acknowledged** `AA`, so an acknowledgement means HIE has it. A message that cannot be stored is answered `AE` (the sender keeps and resends it); bytes that are not HL7 are answered `AR` and dropped. The spool is picked up every `poll_seconds` like a folder: one load per message, the same SHA-256 dedupe (a resent message is a duplicate, not a second update), the transform, delivery. The listener starts with the source and is retried, with an alert, when the port cannot be bound. There is no TLS on the listener; put it behind a TLS proxy or a VPN as MLLP usually is. The connection test checks the port can be taken (when the source is not already listening) and counts what waits in the spool.
-
-### Delivery methods
-
-`delivery.method` picks how a source's records reach HFS:
-
-- **`rest`** (default): the transform runs on every record and the resources go out in `batch` Bundles, one `PUT` per record, with a status per entry. For anything that needs a transform, and for feeds of hundreds to tens of thousands of records at a time.
-- **`bulk_submit`**: HFS ingests through a `$bulk-submit` manifest the engine serves at `{public_url}/bulk/{token}/manifest.json`, polls the status URL, reads HFS's receipts (`{"reference": "Type/id"}` per stored resource, an `OperationOutcome` per failure) and maps them to its records by `Type/id`. What the manifest points at is `delivery.bulk_from`:
-  - `source_objects`: for data that already is FHIR with ids, such as an NDJSON export. No transform runs. The engine stores the rows for the history, predicts what HFS will refuse (no `resourceType`, no `id`), and hands the **source objects themselves** over: pre-signed URLs for S3 objects, the engine's own `/bulk/{token}/files/{n}` for folder files. One submission per drop (up to `manifest_objects_max` objects), with a `submissionId` derived from the files so a repeated drop is refused by HFS instead of ingested twice. Objects stay at the source until the receipts are in, then they are archived.
-  - `transformed`: for anything else, a lab CSV included. The transform runs as on the REST path; a resource that carries only an `identifier` gets an **`id` derived from it** (48 hex characters of SHA-256 over `system|value`), so `$bulk-submit`, which stores by id, updates the same resource every time the row is sent. The engine writes the resources as NDJSON per resource type, puts them in the source's own store when it can sign URLs (an S3 source: HFS fetches from the bucket, under `{archive_prefix}/submissions/{token}/`) or serves them itself from `bulk_dir`, and opens one submission per `bulk_records_max` records. The source file is archived as soon as it is read; the engine's files go once the receipts are in.
-  - `auto` (the default): `source_objects` for NDJSON or Bundle files with the passthrough transform, `transformed` otherwise.
-
-  `url_ttl_seconds` bounds how long the URLs stay valid.
-
-`public_url` in `hie.yaml` must be the URL HFS reaches the engine at.
-
-The same document is what `POST /api/sources` takes. Before creating one, `POST /api/sources/test` with `{"source": {...}}` lists the connection once and answers with the evidence: reachable or not, in how many milliseconds, how many objects match, and the newest one.
-
-### Alerts and rules
-
-Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). Every source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it.
-
-| Condition | Threshold | Fires when | Clears when |
-|-----------|-----------|------------|-------------|
-| `silence` | a duration, `2h` | nothing has arrived for longer than that | data arrives |
-| `missing_by` | a time of day in UTC, `06:00` | that time passes and nothing arrived today | the file arrives |
-| `rejected_share` | a percentage, `10%` | a load has more than that share of rows rejected | a later load is within the limit |
-| `unreachable` | a number of attempts, `5` | delivery to HFS has failed that many times in a row | delivery succeeds |
-
-A condition raises **one** alert per rule and source, open until it clears itself; the alert keeps its rule, who was notified, the channels, and the clearing time and reason. `app` alerts are what the UI lists; `webhook` posts them to `alerts.webhook_url` (the `text` field is the shape Slack and Teams accept); `email` is accepted and recorded, with no mail sink wired yet. A source with no `rejected_share` rule alerts on every load that rejects rows, and one with no `unreachable` rule alerts after `delivery.alert_after_attempts`.
-
-## Transforms
-
-```python
-from hie import DataError
-
-def transform(record, context):
-    # record: one CSV row as a dict of strings, one NDJSON line, or one Bundle entry's resource
-    # context: {"feed", "file", "line"}
-    if not record["value"]:
-        raise DataError("missing value")           # rejected with this reason
-    return {"resourceType": "Observation",
-            "identifier": [{"system": "urn:...", "value": "..."}],  # makes re-sends updates
-            ...}
-```
-
-- A transform returns a resource, a list of resources, or `None` (filtered out).
-- Every resource needs an `id` (delivered as `PUT Type/id`) or an `identifier` with system and value (delivered as `PUT Type?identifier=system|value`), so sending the same record twice updates instead of duplicating.
-- `DataError` rejects the row with its message. Any other exception is recorded with its traceback as a transform bug.
-- Data that already is FHIR (NDJSON exports, Bundle files) goes through `transforms/fhir_passthrough.py`. A Bundle is split into one record per entry, and references between entries (`urn:uuid:...`) are rewritten to `Type/id`.
-- On the REST path the engine transforms and delivers **at the same time**: each chunk of transformed records goes out in batch Bundles while Python works on the next, so a large file takes about the longer of the two rather than their sum.
-
-### Where transforms run
-
-By default each source runs its transform in a Python process of its own, started by the engine from `hie_runtime/worker.py`, fed one record at a time over stdin/stdout as JSON lines, and restarted if it dies. With a **shared runtime** configured, transforms run at [python-runtime](https://github.com/HeliosSoftware/python-runtime) instead, in a sandbox, through its HIE facade:
-
-```yaml
-runtime:
-  url: http://127.0.0.1:8790        # HIE_RUNTIME_URL overrides it
-  token_env: HIE_RUNTIME_TOKEN      # the consumer's bearer token, read from the environment
-  batch_size: 200                   # records per call (at most 1000; the runtime partitions them further)
-```
-
-The engine stores a transform's code under the file's name (`PUT /transforms/{name}`, once per version of the file; the sha256 the runtime answers must match), sends each chunk as one call (`POST /transforms/{name}/run`) and reads one reply per record, in the worker's own line format, so the outcomes (`resources`, `data` error, `transform` error with its trace) are the same as locally. A runtime that forgot the code (`404 transform_unknown`, after a restart without its store) gets it stored again before the batch runs. A runtime that is busy, not ready or unreachable, or a transform that fails to load there, leaves the records received and the batch is tried again on the next pass; the reason is in the log. Try (`POST /api/transforms/{name}/try`) runs the code inline at the runtime (`POST /transforms/try`) without storing it. The runtime's sandbox has no network, so the terminology helpers answer `None` there, and `hie.py` is the runtime's own pinned copy.
-
-### Terminology
-
-With `terminology_url` in `hie.yaml` (or `HIE_TERMINOLOGY_SERVER`; `HIE_TERMINOLOGY_TOKEN` adds a bearer token) naming an HTS, a transform can ask the terminology server:
-
-```python
-from hie import DataError, lookup, translate
-
-known = lookup("http://loinc.org", code)                     # CodeSystem/$lookup: {"display": ...} or None
-mapped = translate(code, "urn:lab:north:codes", "http://loinc.org")  # ConceptMap/$translate: {"code", "display", "system"} or None
-```
-
-Answers are cached for the life of the worker. A code the server does not know is `None`, and the transform decides (usually a `DataError`); a server that cannot be reached raises `TerminologyError`, which the engine treats as **transient**: the record waits and is tried again, nothing is rejected. Without a server both helpers answer `None`, so a transform keeps a fallback or rejects. `transforms/lab_results.py` does both: a LOINC code must be known to the server when there is one, and takes its display from it; a local code goes through the server's ConceptMap first and the script's own table second.
-
-## API
-
-| Method and path | Does |
-|---|---|
-| `GET /api/sources` | Every source: definition, state (`waiting`, `receiving`, `late`, `paused`), freshness, record counts, last file, last alert |
-| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid |
-| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at` |
-| `GET /api/sources/{id}` | One source, as above |
-| `PUT /api/sources/{id}` | Replaces the definition and restarts the source |
-| `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
-| `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
-| `POST /api/sources/{id}/resume` | Resumes and passes at once |
-| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
-| `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
-| `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
-| `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
-| `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
-| `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
-| `GET /api/transforms/{name}` | The transform's code |
-| `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
-| `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason |
-| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
-| `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
-| `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
-| `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
-| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
-| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
-| `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
-| `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp"}` |
-
-## Authentication
-
-With `HIE_AUTH_ENABLED=true`, every request under `/api` needs a bearer token signed by the identity provider: a JWT validated against `HIE_AUTH_JWKS_URL` with the expected `HIE_AUTH_ISSUER` and, when set, `HIE_AUTH_AUDIENCE`. This is the same validation HFS performs, through its `helios-auth` crate. `/health` and `/metrics` stay open. A missing or invalid token answers `401` with `WWW-Authenticate: Bearer`. A pause without a `by` in the body records the token's subject.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `HIE_AUTH_ENABLED` | `false` | Require bearer tokens under `/api` |
-| `HIE_AUTH_JWKS_URL` | | The identity provider's JWKS |
-| `HIE_AUTH_ISSUER` | | Expected `iss`; required when enabled |
-| `HIE_AUTH_AUDIENCE` | | Expected `aud`, when the provider sets one |
-| `HIE_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Accepted signing algorithms |
-| `HIE_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Seconds between JWKS refreshes |
-
-What a token may do is decided by its scopes (the `scope`, `scp` or `roles` claim, as HFS reads them):
-
-| Scope | Grants |
-|---|---|
-| `hie/read` | Every `GET`: sources, loads, records, transforms, alerts, rules, monitoring |
-| `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading |
-| `hie/transforms` | `PUT /api/transforms/{name}`: code the engine then runs; and reading |
-| `hie/*` | Everything |
-
-A valid token without the scope a request needs answers `403` with the scope in `required`. A token from the same identity provider that carries only HFS scopes (`system/*.cruds`) is authenticated but may do nothing here.
-
-`docker/keycloak/` holds a Keycloak for local work: HFS's `fhir` realm (its `hfs-backend-client`, which the engine uses towards HFS) plus the `hie/*` client scopes and three service-account clients, `hie-admin-client` (`hie/*`), `hie-operator-client` (`hie/manage`) and `hie-monitor-client` (`hie/read`), all with audience `hie-api`. `docker compose -f docker/keycloak/docker-compose.yml up -d` serves it on 8180; `docker/keycloak/get-token.sh [client]` prints a token. The engine then runs with `HIE_AUTH_JWKS_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/certs`, `HIE_AUTH_ISSUER=http://localhost:8180/realms/fhir`, `HIE_AUTH_AUDIENCE=hie-api`, and `HIE_FHIR_TOKEN_URL=http://localhost:8180/realms/fhir/protocol/openid-connect/token` with `hfs-backend-client` / `hfs-backend-secret` towards an HFS configured for the same realm.
-
-With auth off the engine logs a warning at start: `PUT /api/transforms/{name}` writes code the engine then runs, so an open API must only be reachable from trusted clients.
-
-### The engine's identity towards HFS
-
-The engine calls HFS as itself, with an OAuth2 **client-credentials** grant at the identity provider's token endpoint (Keycloak first; the same providers HFS accepts). The token is cached and renewed a minute before it expires; a `401` or `403` from HFS discards it, the rows wait, and the next pass goes out with a fresh one. A token endpoint that cannot be reached or refuses the client is a transient delivery failure, so the data is kept and the outage alerts say why. A wrong endpoint or secret fails at startup.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `HIE_FHIR_TOKEN_URL` | | The provider's token endpoint, e.g. `https://idp/realms/hfs/protocol/openid-connect/token` |
-| `HIE_FHIR_CLIENT_ID` | | The engine's client |
-| `HIE_FHIR_CLIENT_SECRET` | | Its secret |
-| `HIE_FHIR_SCOPE` | | Scopes to ask for, when the provider needs them, e.g. `system/*.cruds` |
-
-With none of them set the engine calls HFS anonymously and logs a warning at start, which is what the public sandbox does against the public HFS. Setting some but not all three is refused.
-
-## Release and deploy
-
-A version tag (`v0.1.0`) runs `.github/workflows/release.yml`, modelled on the HFS release chain (see [RELEASING.md](RELEASING.md) for how to cut one):
-
-1. **Build**: the Linux x86_64 release binary, packaged with `hie_runtime/`, `transforms/`, `sources/` and `examples/` as `hie-{version}-x86_64-unknown-linux-gnu.tar.gz`.
-2. **Release**: a GitHub Release with the archive and its SHA-256.
-3. **Image**: `ghcr.io/heliossoftware/hie:{version}`, `:{major.minor}`, `:sha-{sha}`, and `:latest` for a non-prerelease.
-4. **Deploy**: from the `Deploy` runner over SSH to the host behind `hie.heliossoftware.com`: the binary and runtime go to `/opt/hie`, a systemd unit `hie` runs it on `0.0.0.0:8090`, and the job fails unless `/health` answers. `data/` and anything created through the API in `sources/` and `transforms/` survive a deploy.
-
-Secrets the deploy needs: `HIE_DEPLOY_HOST`, `HIE_DEPLOY_USER`, `HIE_DEPLOY_PORT` (optional) and `HIE_FHIR_BASE_URL` (defaults to the public HFS). The public sandbox at `hie.heliossoftware.com` is deployed open, like the public HFS: a place to show the work and run demos, with nothing sensitive on it. A secure environment adds `HIE_AUTH_JWKS_URL`, `HIE_AUTH_ISSUER` and `HIE_AUTH_AUDIENCE` for the API, and `HIE_FHIR_TOKEN_URL`, `HIE_FHIR_CLIENT_ID`, `HIE_FHIR_CLIENT_SECRET` (and `HIE_FHIR_SCOPE`) for the engine's calls to HFS; the deploy writes them to the root-only `/etc/hie/hie.env` on the host.
-
-## Layout
-
-```
-src/            engine: config, sources (folder, S3), readers (CSV, NDJSON, Bundle), transform worker,
-                FHIR delivery, pipeline, the source manager, API, alerts, storage
-hie_runtime/    Python side of the transform protocol (worker.py, hie.DataError)
-transforms/     Python transforms: lab_results.py (CSV to Observation), fhir_passthrough.py
-sources/        one YAML file per source; the API writes here too
-examples/data/  sample files used by the tests and the demo
-tests/          end-to-end Rust tests with a stand-in FHIR server; Python tests for the transform
-docs/           design decisions
-```
-
-## Tests
-
-```sh
-cargo test                                 # unit tests and the end-to-end tests
-python -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py tests/test_worker.py
-cargo clippy --all-targets -- -D warnings
-```
-
-The end-to-end tests run the real Python transforms against a stand-in FHIR server. `tests/pipeline.rs` covers a folder source: the outage and recovery, the duplicate file and the re-sent rows, each kind of bad row, reprocessing with a correction, and the silence alert. `tests/alerts.rs` covers the rules: the one a source is born with, the CRUD, and the `rejected_share` and `silence` rules firing once and clearing. `tests/bulk_submit.rs` drives both bulk paths against a stand-in consumer: an NDJSON export handed over as source objects, and a lab CSV transformed, given derived ids, written by the engine and settled by receipts. `tests/object_source.rs` covers the object-store path the S3 source uses, with an in-memory store; `tests/sqs_source.rs` adds a notification queue to it, against a stand-in SQS that checks the SigV4 headers: the bucket listed once at start, then only announced objects taken, with their messages deleted after the pass and test events, foreign keys and gone objects consumed without effect; `tests/runtime.rs` runs a feed against a stand-in of python-runtime's HIE facade: the code stored once per version and again after the runtime lost it, batches of `batch_size`, one reply per record applied, records waiting while the runtime is busy, and Try inline; `tests/overlap.rs` checks that HFS receives the first Bundle well before a slow transform finishes the file; the same source was run by hand against a MinIO (the `ghcr.io/coollabsio/minio` mirror HFS's CI pins) holding the Synthea export, on both delivery paths against an HFS that requires tokens: 632 resources by REST and the same 632 by `$bulk-submit` through pre-signed URLs, each resource stored once, objects archived under the processed prefix, and a re-uploaded file recognised as a duplicate. `tests/fhir_server_source.rs` covers pulling another FHIR server: pages followed, a cursor per type that moves once the records are stored, nothing pulled twice, the token on every call, and the connection test. `tests/database_source.rs` covers the database source on SQLite: runs of the query past a cursor, the cursor moving once the rows are stored, nothing read twice, `cursor_start`, and the connection test; `tests/mssql_source.rs` runs the same source against a SQL Server when `HIE_TEST_MSSQL_URL` is set, and is skipped otherwise. `tests/leases.rs` puts two instances on one store: one runs the source, the other stands by, and takes over when the lease lapses. `tests/test_terminology.py` covers the terminology helpers against a stand-in HTS and the lab transform using them. `tests/zip_drop.rs` covers zips: a drop in a read-only bucket unpacked once and left in place, and one in a folder unpacked and archived, with a broken zip reported. `tests/hl7v2.rs` covers HL7 v2: a file of messages through a folder source, and messages over MLLP spooled, acknowledged, delivered, and resent as duplicates; `tests/test_hl7.py` covers the Python helpers. `tests/api.rs` drives a source through the API: test, create, check now, pause, resume, replace, delete.
-
-They are skipped if no Python 3.8+ is found; set `HIE_TEST_PYTHON` to point at one.
+HIE is released under the [MIT License](LICENSE.md).
