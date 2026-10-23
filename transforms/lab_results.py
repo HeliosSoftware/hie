@@ -55,7 +55,10 @@ def transform(record, context):
         # A local code: the terminology server's ConceptMap first, the table here second.
         mapped = translate(code, LOCAL_SYSTEM, LOINC_SYSTEM)
         if mapped:
-            code, display = mapped["code"], mapped["display"] or display
+            # The map names the LOINC code; LOINC itself names the display.
+            code = mapped["code"]
+            known = lookup(LOINC_SYSTEM, code)
+            display = (known and known["display"]) or mapped["display"] or display
         elif code.upper() in LOCAL_CODES:
             code, display = LOCAL_CODES[code.upper()]
         else:
