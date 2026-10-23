@@ -61,7 +61,6 @@ Available today in the current release. The reasons behind each choice are in [d
 - Connectors: MongoDB, Oracle, SFTP, Kafka
 - FHIR Mapping Language and StructureMap as an alternative to Python
 - Record-level parallelism within one source
-- AI-assisted transform authoring from a sample file
 
 ---
 
