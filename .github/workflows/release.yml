@@ -105,7 +105,9 @@ jobs:
 
   deploy:
     name: Deploy hie
-    runs-on: [self-hosted, Linux, Deploy]
+    # Deploy alone: the org deploy runner is registered with --no-default-labels,
+    # so no self-hosted CI job can land on it.
+    runs-on: [Deploy]
     needs: [release, docker]
     steps:
       - name: Download release archive
