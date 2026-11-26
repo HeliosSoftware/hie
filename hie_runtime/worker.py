@@ -22,6 +22,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import marshal
 import os
 import sys
 import traceback
@@ -35,21 +36,31 @@ from hie import DataError, TerminologyError  # noqa: E402
 def load(path):
     """The script's module, and the SHA-256 of the bytes it was made from.
 
-    A source file is read once and those bytes are both hashed and compiled,
-    so the hash names the code that runs even if the file is replaced while
-    it loads. Anything else (a compiled `.pyc`) goes through its own loader.
+    The file is read once and those bytes are both hashed and run, so the hash
+    names the code that runs even if the file is replaced while it loads: a
+    source file is compiled from them, a compiled `.pyc` unmarshalled from
+    them. Anything else goes through its own loader and is named by no hash.
     """
     spec = importlib.util.spec_from_file_location("hie_transform", path)
     module = importlib.util.module_from_spec(spec)
-    data = Path(path).read_bytes()
     if isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+        data = Path(path).read_bytes()
         code = compile(data, spec.origin, "exec", dont_inherit=True)
-        exec(code, module.__dict__)
+    elif isinstance(spec.loader, importlib.machinery.SourcelessFileLoader):
+        data = Path(path).read_bytes()
+        # The header, as the loader checks it: the magic number of this
+        # Python, then flags and the source's stamp (16 bytes in all).
+        if data[:4] != importlib.util.MAGIC_NUMBER:
+            raise ImportError(f"bad magic number in {path!r}")
+        code = marshal.loads(memoryview(data)[16:])
     else:
         spec.loader.exec_module(module)
+        data = None
+    if data is not None:
+        exec(code, module.__dict__)
     if not callable(getattr(module, "transform", None)):
         raise SystemExit(f"{path} does not define transform(record, context)")
-    return module, hashlib.sha256(data).hexdigest()
+    return module, (hashlib.sha256(data).hexdigest() if data is not None else None)
 
 
 def main():

@@ -88,22 +88,56 @@ class TheCodeThatRan(unittest.TestCase):
     """The ready line names the bytes the worker compiled, not the file as it
     is later: the engine stores that hash with every record it settles."""
 
-    def test_the_hash_is_of_the_bytes_compiled_even_if_the_file_changes_while_it_loads(self):
+    def loaded_while_replaced(self, transform, replacement):
+        """`worker.load` of `transform`, with the file replaced by
+        `replacement` right after the worker first reads it, as a save landing
+        while the worker loads would."""
+        import importlib.util as util
+
+        spec = util.spec_from_file_location("hie_worker_under_test", ROOT / "hie_runtime" / "worker.py")
+        worker = util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        original = Path.read_bytes
+
+        def read_then_replace(path):
+            data = original(path)
+            if Path(path) == Path(transform):
+                Path(path).write_bytes(replacement)
+            return data
+
+        Path.read_bytes = read_then_replace
+        try:
+            return worker.load(str(transform))
+        finally:
+            Path.read_bytes = original
+
+    def test_the_hash_is_of_the_bytes_run_even_if_the_file_changes_while_it_loads(self):
+        first = b"def transform(record, context):\n    return 'first'\n"
+        second = b"def transform(record, context):\n    return 'second'\n"
         with tempfile.TemporaryDirectory() as run:
             transform = Path(run, "saved_meanwhile.py")
-            # The script replaces its own file as it is imported, as a save
-            # landing between the worker's read and its first request would.
-            first = (
-                "from pathlib import Path\n"
-                "Path(__file__).write_text(\"def transform(record, context):\\n    return {'resourceType': 'Observation', 'id': 'second'}\\n\")\n"
-                "def transform(record, context):\n"
-                "    return {'resourceType': 'Observation', 'id': 'first'}\n"
-            )
-            transform.write_text(first)
-            lines, _ = run_once(transform)
-            self.assertNotEqual(transform.read_text(), first, "the file was replaced")
-        self.assertEqual(lines[0], {"ready": True, "transform_sha256": hashlib.sha256(first.encode()).hexdigest()})
-        self.assertEqual(lines[1]["resources"], [{"resourceType": "Observation", "id": "first"}])
+            transform.write_bytes(first)
+            module, sha256 = self.loaded_while_replaced(transform, second)
+            self.assertEqual(transform.read_bytes(), second, "the file was replaced")
+        self.assertEqual(module.transform({}, {}), "first")
+        self.assertEqual(sha256, hashlib.sha256(first).hexdigest())
+
+    def test_a_compiled_transform_is_run_from_the_bytes_it_is_named_by(self):
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as run:
+            compiled = {}
+            for name in ("first", "second"):
+                source = Path(run, f"{name}.py")
+                source.write_text(f"def transform(record, context):\n    return {name!r}\n")
+                target = Path(run, f"{name}.pyc")
+                py_compile.compile(str(source), cfile=str(target), doraise=True)
+                compiled[name] = target.read_bytes()
+            transform = Path(run, "compiled.pyc")
+            transform.write_bytes(compiled["first"])
+            module, sha256 = self.loaded_while_replaced(transform, compiled["second"])
+        self.assertEqual(module.transform({}, {}), "first")
+        self.assertEqual(sha256, hashlib.sha256(compiled["first"]).hexdigest())
 
     def test_a_compiled_transform_still_loads_and_is_named_by_its_bytes(self):
         import py_compile
