@@ -139,6 +139,32 @@ class TheCodeThatRan(unittest.TestCase):
         self.assertEqual(module.transform({}, {}), "first")
         self.assertEqual(sha256, hashlib.sha256(compiled["first"]).hexdigest())
 
+    def test_a_compiled_file_the_loader_would_refuse_is_refused(self):
+        import importlib.util as util
+        import marshal
+        import py_compile
+
+        spec = util.spec_from_file_location("hie_worker_under_test", ROOT / "hie_runtime" / "worker.py")
+        worker = util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        with tempfile.TemporaryDirectory() as run:
+            source = Path(run, "t.py")
+            source.write_text("def transform(record, context):\n    return 'ran'\n")
+            good = Path(py_compile.compile(str(source), cfile=str(Path(run, "good.pyc")), doraise=True)).read_bytes()
+            cases = {
+                "invalid flags": good[:4] + (8).to_bytes(4, "little") + good[8:],
+                "Non-code object": good[:16] + marshal.dumps("def transform(record, context):\n    return 'ran'\n"),
+                "bad magic number": b"\0\0\0\0" + good[4:],
+                "too short": good[:10],
+            }
+            for reason, data in cases.items():
+                with self.subTest(reason):
+                    bad = Path(run, "bad.pyc")
+                    bad.write_bytes(data)
+                    with self.assertRaises((ImportError, EOFError)) as caught:
+                        worker.load(str(bad))
+                    self.assertIn(reason, str(caught.exception))
+
     def test_a_compiled_transform_still_loads_and_is_named_by_its_bytes(self):
         import py_compile
 

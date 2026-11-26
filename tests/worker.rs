@@ -44,6 +44,8 @@ if mode != "never-ready":
         ready["transform_sha256"] = "ab" * 32
     if mode == "ready-bad-hash":
         ready["transform_sha256"] = "AB" * 32
+    if mode == "ready-null-hash":
+        ready["transform_sha256"] = None
     print(json.dumps(ready))
 if mode in ("never-ready", "not-reading"):
     time.sleep(60)
@@ -343,9 +345,10 @@ async fn each_outcome_names_the_code_its_worker_reported_in_its_ready_line() {
     assert_eq!(died.transform_sha256.as_deref(), Some(reported.as_str()));
     t.close().await;
 
-    // A program that sends the old ready line, or a hash that is not 64
-    // lowercase hex digits, still runs; its outcomes name no code.
-    for mode in ["normal", "ready-bad-hash"] {
+    // A program that sends the old ready line, no hash (the real worker for a
+    // transform it loads some other way) or a hash that is not 64 lowercase
+    // hex digits still runs; its outcomes name no code.
+    for mode in ["normal", "ready-null-hash", "ready-bad-hash"] {
         let t = rig.transformer(mode, limits());
         let ran = t.run(&json!({"echo": "b"}), &ctx()).await.unwrap();
         assert_eq!(reply(ran.outcome)["echo"], "b", "{mode}");
