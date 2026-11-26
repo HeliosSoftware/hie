@@ -206,6 +206,7 @@ impl Engine {
             db.mark_transformed(
                 &item,
                 &json!([{"resourceType": "Observation", "id": format!("o{id}"), "status": "final"}]),
+                None,
             )
             .unwrap();
         }
@@ -588,7 +589,7 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         )
         .unwrap();
         for item in db.received_records("sent-source", 2).unwrap() {
-            db.mark_transformed(&item, &json!([])).unwrap();
+            db.mark_transformed(&item, &json!([]), None).unwrap();
         }
         let mut due = db.due_records("sent-source", 2).unwrap();
         let (retried, newest) = (due.remove(0), due.remove(0));

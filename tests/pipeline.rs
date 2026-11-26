@@ -1174,9 +1174,12 @@ async fn a_transform_saved_mid_record_runs_each_record_once() {
     };
     let api = probe.api().await;
     let code = probe.manager.transform_code("probe").unwrap().unwrap();
+    // Other bytes, the same behaviour: the record in flight still runs on the
+    // code its worker loaded.
+    let saved = format!("{code}\n# saved while record 1 was in flight\n");
     let status = reqwest::Client::new()
         .put(format!("{api}/api/transforms/probe"))
-        .json(&json!({"code": code}))
+        .json(&json!({"code": saved}))
         .send()
         .await
         .unwrap()
@@ -1185,6 +1188,25 @@ async fn a_transform_saved_mid_record_runs_each_record_once() {
     probe.release("1").await;
     probe.wait_sent(&["1", "2", "3"]).await;
     probe.assert_once(&["1", "2", "3"]);
+    let codes: HashMap<String, Value> = probe
+        .app
+        .db
+        .query_json(
+            "SELECT raw, transform_sha256 FROM records WHERE feed_id = 'probe'",
+            [],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r["raw"]["id"].as_str().unwrap().to_string(),
+                r["transform_sha256"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(codes["1"], json!(sha256_hex(&code)), "{codes:?}");
+    assert_eq!(codes["2"], json!(sha256_hex(&saved)), "{codes:?}");
+    assert_eq!(codes["3"], json!(sha256_hex(&saved)), "{codes:?}");
 }
 
 #[tokio::test]
@@ -1320,4 +1342,307 @@ async fn deleted_sources_leave_no_runner_slots_behind() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(probe.manager.runner_slots(), 1);
+}
+
+// ---- the code each record ran with ------------------------------------------
+
+/// The first version: `x` and `y` are bad values, `skip` is filtered out,
+/// `noid` makes a resource the engine refuses, `crash` ends the process, and
+/// `refused` makes one the stand-in FHIR server refuses.
+const CODE_V1: &str = r#"
+import os
+
+from hie import DataError
+
+
+def transform(record, context):
+    kind = record["kind"]
+    if kind in ("x", "y"):
+        raise DataError(f"value {kind!r} is not a number")
+    if kind == "skip":
+        return None
+    if kind == "noid":
+        return {"resourceType": "Observation", "status": "final"}
+    if kind == "crash":
+        os._exit(3)
+    subject = "Patient/999" if kind == "refused" else "Patient/1"
+    return {"resourceType": "Observation", "id": "o" + record["n"], "status": "final",
+            "code": {"text": "t"}, "subject": {"reference": subject}}
+"#;
+
+fn sha256_hex(text: &str) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()))
+}
+
+/// Each record's `transform_sha256` as `GET /api/records` answers it, by `n`.
+async fn codes_by_n(
+    http: &reqwest::Client,
+    api: &str,
+    state: &hie::api::AppState,
+    load: i64,
+) -> HashMap<String, (String, Value)> {
+    let listed: Value = http
+        .get(format!("{api}/api/records?file_id={load}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let raws: HashMap<i64, String> = state
+        .db
+        .query_json(
+            "SELECT id, raw FROM records WHERE file_id = $1",
+            hie::db::params![load],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r["id"].as_i64().unwrap(),
+                r["raw"]["n"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    listed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                raws[&r["id"].as_i64().unwrap()].clone(),
+                (
+                    r["status"].as_str().unwrap().to_string(),
+                    r["transform_sha256"].clone(),
+                ),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn each_record_names_the_transform_code_it_ran_with() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, _fhir) = fhir_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(root.join("transforms/codes.py"), CODE_V1).unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {base}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/codes.yaml"),
+        "id: codes\nname: Codes\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/codes.py\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("codes", None).unwrap(); // the test drives the passes itself
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let router = hie::api::router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let http = reqwest::Client::new();
+    let v1 = json!(sha256_hex(CODE_V1));
+
+    drop_file(
+        &root.join("inbox"),
+        "codes.csv",
+        "n,kind\n1,ok\n2,x\n3,y\n4,y\n5,skip\n6,noid\n7,refused\n8,crash\n9,ok\n",
+    );
+    manager.runner("codes").unwrap().tick().await.unwrap();
+    let load = file_id(&state, "codes.csv").as_i64().unwrap();
+
+    // Every outcome of the transform step names v1, whatever it was, and a
+    // row the FHIR server refused afterwards keeps it.
+    let codes = codes_by_n(&http, &api, &state, load).await;
+    for (n, status) in [
+        ("1", "sent"),
+        ("2", "rejected"),
+        ("3", "rejected"),
+        ("4", "rejected"),
+        ("5", "rejected"),
+        ("6", "rejected"),
+        ("7", "rejected"),
+        ("8", "rejected"),
+        ("9", "sent"),
+    ] {
+        assert_eq!(codes[n], (status.to_string(), v1.clone()), "row {n}");
+    }
+    let one = |n: &str| {
+        state
+            .db
+            .query_json(
+                "SELECT id FROM records WHERE file_id = $1 AND line = $2",
+                hie::db::params![load, n.parse::<i64>().unwrap() + 1],
+            )
+            .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let record: Value = http
+        .get(format!("{api}/api/records/{}", one("7")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(record["error_kind"], "server", "{record}");
+    assert_eq!(record["transform_sha256"], v1, "{record}");
+
+    // v2 accepts x and still rejects y, with the same reason.
+    let v2_code = CODE_V1.replace(r#"("x", "y")"#, r#"("y",)"#);
+    let v2 = json!(sha256_hex(&v2_code));
+    assert_ne!(v1, v2);
+    let status = http
+        .put(format!("{api}/api/transforms/codes"))
+        .json(&json!({"code": v2_code}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+
+    // A row put back names no code until it runs again: one of the two y rows
+    // reprocessed as it is, the noid row reprocessed with corrected data, and
+    // the x row by a Retry of its reason.
+    assert!(state.db.reprocess(one("3"), None).unwrap());
+    let mut corrected = state
+        .db
+        .query_json(
+            "SELECT raw FROM records WHERE id = $1",
+            hie::db::params![one("6")],
+        )
+        .unwrap()[0]["raw"]
+        .clone();
+    corrected["note"] = json!("checked");
+    assert!(state.db.reprocess(one("6"), Some(&corrected)).unwrap());
+    let retried: Value = http
+        .post(format!("{api}/api/loads/{load}/retry"))
+        .json(&json!({"reason": "value 'x' is not a number"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retried["retried"], 1, "{retried}");
+    let codes = codes_by_n(&http, &api, &state, load).await;
+    for n in ["2", "3", "6"] {
+        assert_eq!(codes[n], ("received".to_string(), Value::Null), "row {n}");
+    }
+
+    manager.runner("codes").unwrap().tick().await.unwrap();
+    let codes = codes_by_n(&http, &api, &state, load).await;
+    for (n, status, code) in [
+        ("1", "sent", &v1),
+        ("2", "sent", &v2),
+        ("3", "rejected", &v2),
+        ("4", "rejected", &v1),
+        ("6", "rejected", &v2),
+        ("7", "rejected", &v1),
+    ] {
+        assert_eq!(codes[n], (status.to_string(), code.clone()), "row {n}");
+    }
+
+    // The two y rows share kind and reason, not code: two groups, each with
+    // its own row.
+    let detail: Value = http
+        .get(format!("{api}/api/loads/{load}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let groups: Vec<(Value, Value, Vec<Value>)> = detail["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["reason"] == "value 'y' is not a number")
+        .map(|g| {
+            assert_eq!(g["kind"], "data", "{g}");
+            (
+                g["transform_sha256"].clone(),
+                g["count"].clone(),
+                g["samples"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s["id"].clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(groups.len(), 2, "{detail}");
+    assert!(
+        groups.contains(&(v2.clone(), json!(1), vec![json!(one("3"))])),
+        "{groups:?}"
+    );
+    assert!(
+        groups.contains(&(v1.clone(), json!(1), vec![json!(one("4"))])),
+        "{groups:?}"
+    );
+    assert!(
+        detail["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|g| g.get("transform_sha256").is_some()),
+        "{detail}"
+    );
+
+    // An earlier version sharing the store puts row 4 back and runs it again,
+    // writing neither column: the row names no code rather than v1's.
+    state
+        .db
+        .query_json(
+            "UPDATE records SET status = 'received', revision = revision + 1 WHERE id = $1 RETURNING id",
+            hie::db::params![one("4")],
+        )
+        .unwrap();
+    state
+        .db
+        .query_json(
+            "UPDATE records SET status = 'rejected', error_kind = 'data', error = 'value ''y'' is not a number'
+             WHERE id = $1 RETURNING id",
+            hie::db::params![one("4")],
+        )
+        .unwrap();
+    let record: Value = http
+        .get(format!("{api}/api/records/{}", one("4")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(record["status"], "rejected", "{record}");
+    assert_eq!(record["transform_sha256"], Value::Null, "{record}");
+    let detail: Value = http
+        .get(format!("{api}/api/loads/{load}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        detail["failures"].as_array().unwrap().iter().any(|g| {
+            g["reason"] == "value 'y' is not a number"
+                && g["transform_sha256"].is_null()
+                && g["samples"][0]["id"] == json!(one("4"))
+        }),
+        "{detail}"
+    );
 }

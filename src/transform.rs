@@ -24,6 +24,16 @@ pub enum Outcome {
     Transient(String),
 }
 
+/// An outcome, with the code that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transformed {
+    pub outcome: Outcome,
+    /// The SHA-256 of the transform's code as the worker that produced the
+    /// outcome loaded it, also when that worker timed out or died on the
+    /// record; `None` when the worker did not report it.
+    pub transform_sha256: Option<String>,
+}
+
 /// One feed's transform script, run by a long-lived Python worker under the
 /// `limited-process@1` contract (see `crate::worker`).
 pub struct Transformer {
@@ -114,6 +124,13 @@ impl Transformer {
     /// the record's outcome instead: it is rejected, never sent again by the
     /// engine, and the next record gets a new worker.
     pub async fn transform(&self, record: &Value, context: &Value) -> Result<Outcome> {
+        Ok(self.run(record, context).await?.outcome)
+    }
+
+    /// [`Transformer::transform`], with the hash of the code that produced
+    /// the outcome: the code the worker loaded when it started, whatever the
+    /// file holds now.
+    pub async fn run(&self, record: &Value, context: &Value) -> Result<Transformed> {
         let mut slot = self.worker.lock().await;
         let mut generation = match slot.take() {
             Some(generation) if !generation.has_exited() => generation,
@@ -132,16 +149,15 @@ impl Transformer {
             }
         };
         let request = self.limits.request;
-        let rejected = |headline: String, report: GenerationReport| {
-            Ok(Outcome::Rejected {
-                kind: "transform".into(),
-                message: rejection(&headline, &report),
-            })
+        let transform_sha256 = generation.transform_sha256().map(str::to_string);
+        let rejected = |headline: String, report: GenerationReport| Outcome::Rejected {
+            kind: "transform".into(),
+            message: rejection(&headline, &report),
         };
-        match generation.exchange(record, context, request).await {
+        let outcome = match generation.exchange(record, context, request).await {
             Exchange::Reply(reply) => {
                 *slot = Some(generation);
-                Ok(parse_reply(&reply))
+                parse_reply(&reply)
             }
             // worker.py keeps file descriptor 1 off the protocol, so a line
             // that is not JSON came from something else: its reply may still
@@ -200,7 +216,11 @@ impl Transformer {
                 };
                 rejected(headline, report)
             }
-        }
+        };
+        Ok(Transformed {
+            outcome,
+            transform_sha256,
+        })
     }
 
     /// Closes the generation as soon as its process exits while it waits for

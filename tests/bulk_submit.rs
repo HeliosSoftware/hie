@@ -318,6 +318,17 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
             .contains("neither id nor identifier")
     );
     assert_eq!(rejected[1]["line"], 4);
+    // No transform ran on these rows: none names a transform code, the rows
+    // delivered and the rows the preflight refused alike.
+    assert_eq!(
+        db.query_json(
+            "SELECT COUNT(*) AS n FROM records WHERE transform_sha256 IS NOT NULL",
+            []
+        )
+        .unwrap()[0]["n"],
+        0
+    );
+    assert_eq!(sent.len() + rejected.len(), 4);
     assert!(!inbox.join("export.ndjson").exists());
     assert!(inbox.join("processed").read_dir().unwrap().any(|e| {
         e.unwrap()

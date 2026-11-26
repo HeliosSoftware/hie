@@ -1,6 +1,7 @@
 """Runs a transform script for HIE.
 
 Protocol, one JSON object per line:
+  ready    {"ready": true, "transform_sha256": "<hex>"}, once, when the script is loaded
   request  {"id": 1, "record": {...}, "context": {"feed": ..., "file": ..., "line": ...}}
   response {"id": 1, "resources": [...]}
         or {"id": 1, "error": {"kind": "data" | "transform" | "transient", "message": ...}}
@@ -11,9 +12,14 @@ the record again later.
 
 The script defines `transform(record, context)` returning a resource, a list of
 resources or None. It raises `hie.DataError` for bad source data.
+
+`transform_sha256` is the SHA-256 of the script's bytes as this process read
+them: the engine stores it with each record this process settles.
 """
 
 import errno
+import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -27,12 +33,23 @@ from hie import DataError, TerminologyError  # noqa: E402
 
 
 def load(path):
+    """The script's module, and the SHA-256 of the bytes it was made from.
+
+    A source file is read once and those bytes are both hashed and compiled,
+    so the hash names the code that runs even if the file is replaced while
+    it loads. Anything else (a compiled `.pyc`) goes through its own loader.
+    """
     spec = importlib.util.spec_from_file_location("hie_transform", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    data = Path(path).read_bytes()
+    if isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+        code = compile(data, spec.origin, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    else:
+        spec.loader.exec_module(module)
     if not callable(getattr(module, "transform", None)):
         raise SystemExit(f"{path} does not define transform(record, context)")
-    return module
+    return module, hashlib.sha256(data).hexdigest()
 
 
 def main():
@@ -46,8 +63,8 @@ def main():
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="strict")
     os.dup2(2, 1)
     sys.stdout = sys.stderr
-    module = load(sys.argv[1])
-    protocol.write(json.dumps({"ready": True}) + "\n")
+    module, sha256 = load(sys.argv[1])
+    protocol.write(json.dumps({"ready": True, "transform_sha256": sha256}) + "\n")
     protocol.flush()
     for line in sys.stdin:
         if not line.strip():
