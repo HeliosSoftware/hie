@@ -727,7 +727,7 @@ impl Db {
             groups
                 .into_iter()
                 .map(|g| {
-                    json!({"kind": "server", "severity": g.severity, "code": g.code, "reason": g.reason,
+                    json!({"kind": "server", "severity": g.severity, "code": g.code, "reason": g.reason, "transform_sha256": null,
                            "count": g.count, "first_line": null, "samples": []})
                 })
                 .collect(),

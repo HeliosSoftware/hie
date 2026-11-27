@@ -148,7 +148,7 @@ impl Engine {
     /// Transformed, through the same guarded write the pipeline makes.
     fn transform(&self, file: i64, line: i64) {
         let item = self.item(file, line, true);
-        assert!(self.db.mark_transformed(&item, &json!([])).unwrap());
+        assert!(self.db.mark_transformed(&item, &json!([]), None).unwrap());
     }
 
     fn send(&self, file: i64, line: i64) {
@@ -812,6 +812,79 @@ fn loads_finished_before_failing_rows_were_marked_start_at_none() {
         assert_eq!(
             (&row["rejected_reported"], &row["failing_reported"]),
             (&json!(10), &json!(0))
+        );
+    }
+}
+
+/// Records settled by an earlier version name no transform code: the columns
+/// are added once, their rows stay null, and their failures still group.
+#[tokio::test]
+async fn records_settled_before_the_code_was_kept_name_none() {
+    if std::env::var("HIE_TEST_DATABASE_URL").is_ok_and(|v| !v.is_empty()) {
+        return; // The earlier schema is written here for SQLite.
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let old = rusqlite::Connection::open(dir.path().join("data/hie.db")).unwrap();
+    old.execute_batch(
+        "CREATE TABLE files (
+           id INTEGER PRIMARY KEY, feed_id TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL,
+           size INTEGER NOT NULL, status TEXT NOT NULL, duplicate_of INTEGER, received_at INTEGER NOT NULL,
+           finished_at INTEGER, error TEXT, rejected_reported INTEGER NOT NULL DEFAULT 0,
+           source_key TEXT, archived INTEGER NOT NULL DEFAULT 0, origin TEXT, source_name TEXT);
+         CREATE TABLE records (
+           id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id), feed_id TEXT NOT NULL,
+           line INTEGER NOT NULL, raw TEXT NOT NULL, original_raw TEXT, status TEXT NOT NULL,
+           resources TEXT, error_kind TEXT, error TEXT, response TEXT,
+           attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+           updated_at INTEGER NOT NULL, submission TEXT, revision INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at)
+         VALUES ('alpha', 'old.csv', 'sha', 1, 'done', 1000, 2000);
+         INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at)
+         VALUES (1, 'alpha', 2, '{\"n\":\"1\"}', 'rejected', 'data', 'a bad value', 2000),
+                (1, 'alpha', 3, '{\"n\":\"2\"}', 'rejected', 'data', 'a bad value', 2000);",
+    )
+    .unwrap();
+    drop(old);
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let (config, feeds) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+        let (_manager, state) =
+            hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+        let api = serve(hie::api::router(state)).await;
+        let record: Value = reqwest::get(format!("{api}/api/records/1"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(record["status"], "rejected", "{record}");
+        assert_eq!(record["transform_sha256"], Value::Null, "{record}");
+        let listed: Value = reqwest::get(format!("{api}/api/records?file_id=1"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for r in listed["records"].as_array().unwrap() {
+            assert_eq!(r["transform_sha256"], Value::Null, "{r}");
+        }
+        let load: Value = reqwest::get(format!("{api}/api/loads/1"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            load["failures"],
+            json!([{"kind": "data", "reason": "a bad value", "transform_sha256": null,
+                    "count": 2, "first_line": 2,
+                    "samples": [{"id": 1, "line": 2, "raw": {"n": "1"}}, {"id": 2, "line": 3, "raw": {"n": "2"}}]}]),
+            "{load}"
         );
     }
 }

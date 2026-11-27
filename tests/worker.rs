@@ -1,6 +1,7 @@
 //! The transform worker as a host of the `limited-process@1` contract's
 //! long-lived worker pattern: the real `hie_runtime/limits.py` runs a small test
-//! program that speaks HIE's worker protocol (`{"ready": true}`, then one
+//! program that speaks HIE's worker protocol (`{"ready": true}`, with or
+//! without the `transform_sha256` the real worker adds, then one
 //! `{"id", "resources"}` reply per request) and misbehaves on request.
 
 use std::path::{Path, PathBuf};
@@ -38,7 +39,14 @@ if mode == "exit-before-ready":
     sys.stderr.write("boom before ready\n")
     sys.exit(0)
 if mode != "never-ready":
-    print(json.dumps({"ready": True}))
+    ready = {"ready": True}
+    if mode == "ready-hash":
+        ready["transform_sha256"] = "ab" * 32
+    if mode == "ready-bad-hash":
+        ready["transform_sha256"] = "AB" * 32
+    if mode == "ready-null-hash":
+        ready["transform_sha256"] = None
+    print(json.dumps(ready))
 if mode in ("never-ready", "not-reading"):
     time.sleep(60)
 
@@ -315,6 +323,38 @@ async fn echo_answers_in_order_from_one_process() {
         Some(hie::worker::pin().sha256)
     );
     assert!(rig.run_dirs().is_empty(), "{:?}", rig.run_dirs());
+}
+
+#[tokio::test]
+async fn each_outcome_names_the_code_its_worker_reported_in_its_ready_line() {
+    let rig = need_python!();
+    let reported = "ab".repeat(32);
+    let t = rig.transformer("ready-hash", limits());
+    // A reply, a record past its deadline and one whose process dies: each is
+    // the outcome of the worker that loaded that code.
+    let answered = t.run(&json!({"echo": "a"}), &ctx()).await.unwrap();
+    assert_eq!(
+        answered.transform_sha256.as_deref(),
+        Some(reported.as_str())
+    );
+    let late = t.run(&json!({"sleep": 3}), &ctx()).await.unwrap();
+    rejection(late.outcome);
+    assert_eq!(late.transform_sha256.as_deref(), Some(reported.as_str()));
+    let died = t.run(&json!({"exit": 3}), &ctx()).await.unwrap();
+    rejection(died.outcome);
+    assert_eq!(died.transform_sha256.as_deref(), Some(reported.as_str()));
+    t.close().await;
+
+    // A program that sends the old ready line, no hash (the real worker for a
+    // transform it loads some other way) or a hash that is not 64 lowercase
+    // hex digits still runs; its outcomes name no code.
+    for mode in ["normal", "ready-null-hash", "ready-bad-hash"] {
+        let t = rig.transformer(mode, limits());
+        let ran = t.run(&json!({"echo": "b"}), &ctx()).await.unwrap();
+        assert_eq!(reply(ran.outcome)["echo"], "b", "{mode}");
+        assert_eq!(ran.transform_sha256, None, "{mode}");
+        t.close().await;
+    }
 }
 
 #[tokio::test]
@@ -1064,6 +1104,13 @@ def transform(record, context):
     assert!(
         resources.iter().all(|r| r["pid"] == resources[0]["pid"]),
         "the worker was restarted: {resources:?}"
+    );
+    // The real worker names the script's bytes.
+    let script = std::fs::read(dir.path().join("transform.py")).unwrap();
+    let ran = t.run(&json!({"n": 6}), &ctx()).await.unwrap();
+    assert_eq!(
+        ran.transform_sha256,
+        Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&script)))
     );
     let report = t.close().await.unwrap();
     assert_eq!(report.verdict, Verdict::Completed);

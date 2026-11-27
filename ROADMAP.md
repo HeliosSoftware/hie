@@ -28,7 +28,7 @@ Available today in the current release. The reasons behind each choice are in [d
 
 **Operations**
 
-- Every row stored before its file is acknowledged, with file, line, outcome and reason
+- Every row stored before its file is acknowledged, with file, line, outcome, reason and the transform code it ran with
 - Alert rules (silence, missing by, rejected share, unreachable) with webhooks; Prometheus metrics
 - SQLite or PostgreSQL store; several instances sharing one store with leases
 - API with SMART-style scopes (`hie/read`, `hie/manage`, `hie/transforms`) behind any OIDC provider; client credentials towards HFS

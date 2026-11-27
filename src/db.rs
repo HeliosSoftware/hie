@@ -196,6 +196,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Bumped when a person puts a record back: an outcome computed for an older
     // revision changes nothing.
     ("records", "revision", "INTEGER NOT NULL DEFAULT 0"),
+    // The SHA-256 of the transform code that settled the record, and the
+    // revision it settled: an earlier version sharing the store neither writes
+    // nor clears them, so the hash counts only while that revision is current
+    // (see `transform_sha256_of`).
+    ("records", "transform_sha256", "TEXT"),
+    ("records", "transform_revision", "INTEGER"),
     // A submission's failed attempts and its settled rows, counted per page.
     ("submissions", "failures", "INTEGER NOT NULL DEFAULT 0"),
     ("submissions", "sent", "INTEGER NOT NULL DEFAULT 0"),
@@ -233,6 +239,18 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // The instant a check's answer counted the loads listed up to.
     ("checks", "cutoff_at", "INTEGER"),
 ];
+
+/// The SQL for a record's `transform_sha256` as the API answers it, for the
+/// `records` row named `alias`: the stored hash while the record is still at
+/// the revision its transform step settled, `NULL` otherwise. A record put
+/// back by an earlier version sharing the store (which bumps `revision` but
+/// does not clear the hash) and run again by it names no code, rather than
+/// the code of the run before.
+pub fn transform_sha256_of(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.transform_revision = {alias}.revision THEN {alias}.transform_sha256 END"
+    )
+}
 
 /// How long the store write before an untagged REST request may take: a
 /// slower one sends nothing, so the bound below always covers the send.
@@ -1844,27 +1862,41 @@ impl Db {
         .map(drop)
     }
 
-    /// Rejected records of a file, grouped by reason, each with a few sample
-    /// rows: the `filtered` ones too, which do not fail the load.
+    /// Rejected records of a file, grouped by reason and by the transform code
+    /// that rejected them, each with a few sample rows: the `filtered` ones too,
+    /// which do not fail the load.
     pub fn failure_groups(&self, file_id: i64) -> Result<Vec<Value>> {
+        let code = transform_sha256_of("records");
         let groups = self.query_json(
-            "SELECT error_kind AS kind, error AS reason, COUNT(*) AS n, MIN(line) AS first_line
-             FROM records WHERE file_id = $1 AND status = 'rejected'
-             GROUP BY error_kind, error ORDER BY n DESC, first_line",
+            &format!(
+                "SELECT kind, reason, code, COUNT(*) AS n, MIN(line) AS first_line
+                 FROM (SELECT error_kind AS kind, error AS reason, {code} AS code, line
+                       FROM records WHERE file_id = $1 AND status = 'rejected') AS rejected
+                 GROUP BY kind, reason, code ORDER BY n DESC, first_line"
+            ),
             params![file_id],
         )?;
         let mut out = Vec::with_capacity(groups.len());
         for g in groups {
             let samples = self.query_json(
-                "SELECT id, line, raw FROM records
-                 WHERE file_id = $1 AND status = 'rejected'
-                   AND error_kind IS NOT DISTINCT FROM $2 AND error IS NOT DISTINCT FROM $3
-                 ORDER BY line LIMIT 3",
-                params![file_id, g["kind"].as_str(), g["reason"].as_str()],
+                &format!(
+                    "SELECT id, line, raw FROM records
+                     WHERE file_id = $1 AND status = 'rejected'
+                       AND error_kind IS NOT DISTINCT FROM $2 AND error IS NOT DISTINCT FROM $3
+                       AND {code} IS NOT DISTINCT FROM $4
+                     ORDER BY line LIMIT 3"
+                ),
+                params![
+                    file_id,
+                    g["kind"].as_str(),
+                    g["reason"].as_str(),
+                    g["code"].as_str()
+                ],
             )?;
             out.push(json!({
                 "kind": g["kind"],
                 "reason": g["reason"],
+                "transform_sha256": g["code"],
                 "count": g["n"],
                 "first_line": g["first_line"],
                 "samples": samples,
@@ -2027,6 +2059,7 @@ impl Db {
                 &params![file_id, reason],
                 "status = 'received', resources = NULL, error_kind = NULL, error = NULL,
                  response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
+                 transform_sha256 = NULL, transform_revision = NULL,
                  revision = revision + 1, updated_at = $3",
                 &params![now_ms()],
                 "id",
@@ -2255,7 +2288,8 @@ impl Db {
             self.execute(
                 &format!(
                     "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
-                            attempts = 0, next_attempt_at = 0, updated_at = $1
+                            attempts = 0, next_attempt_at = 0, transform_sha256 = NULL, transform_revision = NULL,
+                            updated_at = $1
                      FROM (VALUES {}) AS v
                      WHERE records.id = v.column1 AND records.revision = v.column2 AND records.status = 'received'",
                     rows.join(", ")
@@ -2267,32 +2301,49 @@ impl Db {
     }
 
     /// The transform's resources for a record still `received` at the item's
-    /// revision. Returns whether it changed. The transform step writes no event.
-    pub fn mark_transformed(&self, item: &WorkItem, resources: &Value) -> Result<bool> {
+    /// revision, with the hash of the code that made them. Returns whether it
+    /// changed. The transform step writes no event.
+    pub fn mark_transformed(
+        &self,
+        item: &WorkItem,
+        resources: &Value,
+        transform_sha256: Option<&str>,
+    ) -> Result<bool> {
         Ok(self.execute(
             "UPDATE records SET status = 'pending', resources = $2, error_kind = NULL, error = NULL,
-                    attempts = 0, next_attempt_at = 0, updated_at = $3
+                    attempts = 0, next_attempt_at = 0, transform_sha256 = $5, transform_revision = revision,
+                    updated_at = $3
              WHERE id = $1 AND status = 'received' AND revision = $4",
-            &params![item.id, resources.to_string(), now_ms(), item.revision],
+            &params![
+                item.id,
+                resources.to_string(),
+                now_ms(),
+                item.revision,
+                transform_sha256
+            ],
         )? > 0)
     }
 
     /// Rejects a record still in `from` at the item's revision (`received` for the
-    /// transform and the bulk preflight), with `record.rejected`. Returns whether
-    /// it changed: an outcome for a superseded revision changes nothing.
+    /// transform and the bulk preflight), with `record.rejected` and the hash of
+    /// the transform code that rejected it (`None` when no transform ran).
+    /// Returns whether it changed: an outcome for a superseded revision changes
+    /// nothing.
     pub fn reject_item(
         &self,
         item: &WorkItem,
         from: &str,
         kind: &str,
         error: &str,
+        transform_sha256: Option<&str>,
     ) -> Result<bool> {
         self.transaction(|tx| {
             let Some(r) = tx.query_one(
-                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, transform_sha256 = $7,
+                        transform_revision = revision, updated_at = $4
                  WHERE id = $1 AND status = $5 AND revision = $6
                  RETURNING feed_id, file_id",
-                &params![item.id, kind, error, now_ms(), from, item.revision],
+                &params![item.id, kind, error, now_ms(), from, item.revision, transform_sha256],
             )?
             else {
                 return Ok(false);
@@ -2473,13 +2524,15 @@ impl Db {
                 Some(raw) => tx.execute(
                     "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2, resources = NULL,
                             error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
+                            transform_sha256 = NULL, transform_revision = NULL,
                             revision = revision + 1, updated_at = $3
                      WHERE id = $1",
                     &params![id, raw.to_string(), now],
                 )?,
                 None => tx.execute(
                     "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                            response = NULL, attempts = 0, next_attempt_at = 0, revision = revision + 1, updated_at = $2
+                            response = NULL, attempts = 0, next_attempt_at = 0, transform_sha256 = NULL,
+                            transform_revision = NULL, revision = revision + 1, updated_at = $2
                      WHERE id = $1",
                     &params![id, now],
                 )?,

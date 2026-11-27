@@ -688,6 +688,20 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:** the extension must be right: an NDJSON file saved as `.json` is unreadable once it holds more than one line of resources (one line is read as that resource), and a `.jsonl` file is missed by a `"*json"` pattern. A reference to a Bundle entry that has no `id` stays `urn:uuid:…`, as with `fhir_bundle`. The same bytes under two names read the same way are still one load, as in every source. A `fhir_bundle` zip still reads a manifest as a Bundle, so it is unreadable there. An engine before this one cannot parse a source file that says `format: fhir`, so rolling back means changing or removing that file first.
 
+## 49. Each record names the transform code it ran with: a hash the worker takes of the bytes it compiled
+
+**Chosen:** every record keeps `transform_sha256`, the SHA-256 of the transform file's bytes as the worker that settled the record read them. The worker reads the file once, compiles those bytes and reports their hash in its ready line (`{"ready": true, "transform_sha256": ...}`); the engine keeps it for that worker process and writes it in the same guarded `UPDATE` that stores the transform step's outcome. Delivery never touches it, so a later `server` rejection keeps it. A Retry and a reprocess clear it. It is stored with the revision it settled (`transform_revision`), and read only while the record is still at that revision. `GET /api/records`, `GET /api/records/{id}` and the `failures` of `GET /api/loads/{id}` return it; the groups split by it.
+
+**Why:**
+- A transform is replaced in place under the same name (`PUT /api/transforms/{name}`), so the name does not say which code ran; a hash of the bytes does, and a client that saved the code can compute it.
+- The worker, not the engine, takes it: the file is written before the sources using it restart, and a runner that is still finishing keeps running the code it loaded. A hash the engine took of the file at some moment could describe other bytes than the worker imported. Compiling the bytes that were hashed makes the hash name the code that ran, even when the file changes while it loads.
+- Per worker process, not per file: the outcome of a record whose worker timed out or died is that worker's, and names its code; the record after it gets a new worker, which reads the file again.
+- Cleared when a row is put back: a row waiting to run again has not run with any code yet; keeping the old hash would answer "which code is it failing with" with the code before the fix.
+- Guarded by the revision: an instance of an earlier version sharing the store (0.3.0 or later) bumps the revision when it puts a row back, but neither clears nor writes the hash. Without the guard, a row it ran again would name the code of the run before.
+- Grouped: after a fix, the rows still failing with the new code are what a person needs to see apart from the rows not run again.
+
+**Cost / not yet:** the hash names the transform file only: a change in a module it imports, in `hie_runtime/` or in the interpreter does not change it. Rows settled before this version, rows a source hands over without a transform, and rows an earlier version ran again name no code (`null`); an instance older than 0.3.0, which does not move the revision, leaves a row it ran again naming the code of the run before. A save restarts the sources of the instance that took it only: an instance holding a source's lease elsewhere keeps its worker, and its records name the code that worker loaded. A client that keyed load failure groups by kind and reason gets two groups with the same key when different code rejected their rows, and a Retry by reason still puts back both. No history: a row run again names only its latest code. The worker protocol's ready line gains a field; a program sending the old line still runs, and its records name no code.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

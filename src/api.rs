@@ -1204,10 +1204,11 @@ async fn list_records(State(s): State<AppState>, Query(q): Query<RecordQuery>) -
     let rows = s.db.query_json(
         &format!(
             "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, r.line, r.status, r.error_kind, r.error,
-                    r.attempts, {} AS updated_at
+                    r.attempts, {} AS transform_sha256, {} AS updated_at
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE (CAST($1 AS TEXT) IS NULL OR r.feed_id = CAST($1 AS TEXT)) AND (CAST($2 AS TEXT) IS NULL OR r.status = CAST($2 AS TEXT)) AND (CAST($3 AS BIGINT) IS NULL OR r.file_id = CAST($3 AS BIGINT))
              ORDER BY r.id DESC LIMIT $4",
+            crate::db::transform_sha256_of("r"),
             s.db.iso("r.updated_at")
         ),
         params![q.source, q.status, q.file_id, q.limit.unwrap_or(100)],
@@ -1222,8 +1223,9 @@ async fn get_record(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult
             &format!(
                 "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, f.sha256 AS file_sha256, r.line, r.status,
                         r.raw, r.original_raw, r.resources, r.response, r.error_kind, r.error, r.attempts,
-                        {} AS received_at, {} AS updated_at
+                        {} AS transform_sha256, {} AS received_at, {} AS updated_at
                  FROM records r JOIN files f ON f.id = r.file_id WHERE r.id = $1",
+                crate::db::transform_sha256_of("r"),
                 s.db.iso("f.received_at"),
                 s.db.iso("r.updated_at")
             ),

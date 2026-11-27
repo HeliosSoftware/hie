@@ -314,6 +314,11 @@ pub(crate) fn seconds(d: Duration) -> String {
     }
 }
 
+/// A SHA-256 as the worker writes it: 64 lowercase hex digits.
+fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// `(verdict, cause, exit_code, signal)` for a process that ended on its own.
 fn classify(status: ExitStatus) -> (Verdict, Option<&'static str>, Option<i64>, Option<i32>) {
     #[cfg(unix)]
@@ -559,6 +564,9 @@ pub(crate) struct Generation {
     frozen: Option<Frozen>,
     /// This generation is being finished by its own finalizer task.
     finalizing: bool,
+    /// The SHA-256 of the transform's code as the worker read it, from its
+    /// ready line; `None` for a program that does not report it.
+    transform_sha256: Option<String>,
 }
 
 /// How a generation ended, decided once: a finalizer that resumes a cleanup
@@ -712,6 +720,7 @@ impl Generation {
             busy: true,
             frozen: None,
             finalizing: false,
+            transform_sha256: None,
         };
         match generation.handshake(launch).await {
             Ok(()) => {
@@ -850,10 +859,15 @@ impl Generation {
             Ok(Line::Eof) => Err("the worker exited before it was ready".into()),
             Ok(Line::Overlong) => Err("the worker's first line was too long".into()),
             Ok(Line::Text(text)) => {
-                let ready = serde_json::from_slice::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v.get("ready").cloned());
-                if ready == Some(json!(true)) {
+                let line = serde_json::from_slice::<Value>(&text).ok();
+                let ready = line.as_ref().and_then(|v| v.get("ready"));
+                if ready == Some(&json!(true)) {
+                    self.transform_sha256 = line
+                        .as_ref()
+                        .and_then(|v| v.get("transform_sha256"))
+                        .and_then(Value::as_str)
+                        .filter(|h| is_sha256_hex(h))
+                        .map(str::to_string);
                     Ok(())
                 } else {
                     let shown = String::from_utf8_lossy(&text);
@@ -936,6 +950,12 @@ impl Generation {
 
     pub(crate) fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// The SHA-256 of the code this generation's worker loaded, as its ready
+    /// line reported it: 64 lowercase hex digits, or `None`.
+    pub(crate) fn transform_sha256(&self) -> Option<&str> {
+        self.transform_sha256.as_deref()
     }
 
     /// Becomes ready when the process has exited.
@@ -1124,6 +1144,7 @@ impl Drop for Generation {
                 busy: self.busy,
                 frozen: self.frozen,
                 finalizing: true,
+                transform_sha256: self.transform_sha256.take(),
             };
             handle.spawn(async move {
                 rest.finish(how).await;

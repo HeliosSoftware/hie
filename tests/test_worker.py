@@ -1,5 +1,6 @@
 """The worker over its real pipes: UTF-8 in, UTF-8 out, whatever the locale."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -10,6 +11,26 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def ready_line(transform):
+    """The ready line a worker that loaded `transform` as it is now writes."""
+    return {"ready": True, "transform_sha256": hashlib.sha256(Path(transform).read_bytes()).hexdigest()}
+
+
+def run_once(transform, record=None):
+    """The worker's stdout lines after one request on `transform`."""
+    request = json.dumps({"id": 7, "record": record or {}, "context": {"feed": "t", "file": "t", "line": 1}})
+    proc = subprocess.run(
+        [sys.executable, "-u", str(ROOT / "hie_runtime" / "worker.py"), str(transform)],
+        input=(request + "\n").encode("utf-8"),
+        capture_output=True,
+        timeout=30,
+    )
+    lines = proc.stdout.decode("utf-8").splitlines()
+    if not lines:
+        raise AssertionError(proc.stderr.decode("utf-8", "replace"))
+    return [json.loads(line) for line in lines], proc
 
 
 class WorkerProtocol(unittest.TestCase):
@@ -26,7 +47,11 @@ class WorkerProtocol(unittest.TestCase):
             timeout=30,
         )
         lines = proc.stdout.decode("utf-8").splitlines()
-        self.assertEqual(json.loads(lines[0]), {"ready": True}, proc.stderr.decode("utf-8", "replace"))
+        self.assertEqual(
+            json.loads(lines[0]),
+            ready_line(ROOT / "transforms" / "fhir_passthrough.py"),
+            proc.stderr.decode("utf-8", "replace"),
+        )
         return json.loads(lines[1])
 
     def test_accented_names_survive_the_round_trip(self):
@@ -51,18 +76,107 @@ class WorkerProtocol(unittest.TestCase):
                 "    os.write(1, b'stray\\n')\n"
                 "    return {'resourceType': 'Observation', 'id': 'o1'}\n"
             )
-            request = json.dumps({"id": 7, "record": {}, "context": {"feed": "t", "file": "t", "line": 1}})
-            proc = subprocess.run(
-                [sys.executable, "-u", str(ROOT / "hie_runtime" / "worker.py"), str(transform)],
-                input=(request + "\n").encode("utf-8"),
-                capture_output=True,
-                timeout=30,
-            )
-        lines = proc.stdout.decode("utf-8").splitlines()
-        self.assertEqual(json.loads(lines[0]), {"ready": True})
-        self.assertEqual(json.loads(lines[1]), {"id": 7, "resources": [{"resourceType": "Observation", "id": "o1"}]})
+            expected = ready_line(transform)
+            lines, proc = run_once(transform)
+        self.assertEqual(lines[0], expected)
+        self.assertEqual(lines[1], {"id": 7, "resources": [{"resourceType": "Observation", "id": "o1"}]})
         self.assertEqual(len(lines), 2, lines)
         self.assertIn(b"stray", proc.stderr)
+
+
+class TheCodeThatRan(unittest.TestCase):
+    """The ready line names the bytes the worker compiled, not the file as it
+    is later: the engine stores that hash with every record it settles."""
+
+    def loaded_while_replaced(self, transform, replacement):
+        """`worker.load` of `transform`, with the file replaced by
+        `replacement` right after the worker first reads it, as a save landing
+        while the worker loads would."""
+        import importlib.util as util
+
+        spec = util.spec_from_file_location("hie_worker_under_test", ROOT / "hie_runtime" / "worker.py")
+        worker = util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        original = Path.read_bytes
+
+        def read_then_replace(path):
+            data = original(path)
+            if Path(path) == Path(transform):
+                Path(path).write_bytes(replacement)
+            return data
+
+        Path.read_bytes = read_then_replace
+        try:
+            return worker.load(str(transform))
+        finally:
+            Path.read_bytes = original
+
+    def test_the_hash_is_of_the_bytes_run_even_if_the_file_changes_while_it_loads(self):
+        first = b"def transform(record, context):\n    return 'first'\n"
+        second = b"def transform(record, context):\n    return 'second'\n"
+        with tempfile.TemporaryDirectory() as run:
+            transform = Path(run, "saved_meanwhile.py")
+            transform.write_bytes(first)
+            module, sha256 = self.loaded_while_replaced(transform, second)
+            self.assertEqual(transform.read_bytes(), second, "the file was replaced")
+        self.assertEqual(module.transform({}, {}), "first")
+        self.assertEqual(sha256, hashlib.sha256(first).hexdigest())
+
+    def test_a_compiled_transform_is_run_from_the_bytes_it_is_named_by(self):
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as run:
+            compiled = {}
+            for name in ("first", "second"):
+                source = Path(run, f"{name}.py")
+                source.write_text(f"def transform(record, context):\n    return {name!r}\n")
+                target = Path(run, f"{name}.pyc")
+                py_compile.compile(str(source), cfile=str(target), doraise=True)
+                compiled[name] = target.read_bytes()
+            transform = Path(run, "compiled.pyc")
+            transform.write_bytes(compiled["first"])
+            module, sha256 = self.loaded_while_replaced(transform, compiled["second"])
+        self.assertEqual(module.transform({}, {}), "first")
+        self.assertEqual(sha256, hashlib.sha256(compiled["first"]).hexdigest())
+
+    def test_a_compiled_file_the_loader_would_refuse_is_refused(self):
+        import importlib.util as util
+        import marshal
+        import py_compile
+
+        spec = util.spec_from_file_location("hie_worker_under_test", ROOT / "hie_runtime" / "worker.py")
+        worker = util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        with tempfile.TemporaryDirectory() as run:
+            source = Path(run, "t.py")
+            source.write_text("def transform(record, context):\n    return 'ran'\n")
+            good = Path(py_compile.compile(str(source), cfile=str(Path(run, "good.pyc")), doraise=True)).read_bytes()
+            cases = {
+                "invalid flags": good[:4] + (8).to_bytes(4, "little") + good[8:],
+                "Non-code object": good[:16] + marshal.dumps("def transform(record, context):\n    return 'ran'\n"),
+                "bad magic number": b"\0\0\0\0" + good[4:],
+                "too short": good[:10],
+            }
+            for reason, data in cases.items():
+                with self.subTest(reason):
+                    bad = Path(run, "bad.pyc")
+                    bad.write_bytes(data)
+                    with self.assertRaises((ImportError, EOFError)) as caught:
+                        worker.load(str(bad))
+                    self.assertIn(reason, str(caught.exception))
+
+    def test_a_compiled_transform_still_loads_and_is_named_by_its_bytes(self):
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as run:
+            source = Path(run, "compiled.py")
+            source.write_text("def transform(record, context):\n    return {'resourceType': 'Observation', 'id': 'c1'}\n")
+            compiled = Path(py_compile.compile(str(source), cfile=str(Path(run, "compiled.pyc")), doraise=True))
+            source.unlink()
+            expected = ready_line(compiled)
+            lines, _ = run_once(compiled)
+        self.assertEqual(lines[0], expected)
+        self.assertEqual(lines[1]["resources"], [{"resourceType": "Observation", "id": "c1"}])
 
 
 class Interpreter(unittest.TestCase):
@@ -97,7 +211,7 @@ class UnderTheLauncher(unittest.TestCase):
                 ready = json.loads((control / "ready.json").read_text())
                 self.assertIsNone(ready["error"])
                 (control / "ack").touch()
-                self.assertEqual(json.loads(proc.stdout.readline()), {"ready": True})
+                self.assertEqual(json.loads(proc.stdout.readline()), ready_line(transform))
                 request = {"id": 1, "record": {}, "context": {"feed": "t", "file": "t", "line": 1}}
                 proc.stdin.write((json.dumps(request) + "\n").encode())
                 proc.stdin.flush()

@@ -972,13 +972,15 @@ impl FeedRunner {
                 }
                 let context =
                     json!({"feed": self.feed.id, "file": item.file_name, "line": item.line});
-                let outcome = match self.transformer.transform(&item.raw, &context).await {
-                    Ok(outcome) => outcome,
+                let (outcome, code) = match self.transformer.run(&item.raw, &context).await {
+                    Ok(ran) => (ran.outcome, ran.transform_sha256),
                     Err(e) => {
                         tracing::error!(feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
                         return Ok(());
                     }
                 };
+                // Every outcome below is stored with the code that produced it.
+                let code = code.as_deref();
                 // Each outcome changes the record only while it is still at the
                 // revision it was selected at; a person may have put it back since.
                 match outcome {
@@ -997,7 +999,8 @@ impl FeedRunner {
                         return Ok(());
                     }
                     Outcome::Rejected { kind, message } => {
-                        self.db.reject_item(item, "received", &kind, &message)?;
+                        self.db
+                            .reject_item(item, "received", &kind, &message, code)?;
                     }
                     Outcome::Resources(resources) if resources.is_empty() => {
                         self.db.reject_item(
@@ -1005,6 +1008,7 @@ impl FeedRunner {
                             "received",
                             "filtered",
                             "transform returned no resources",
+                            code,
                         )?;
                     }
                     Outcome::Resources(mut resources) => {
@@ -1023,10 +1027,12 @@ impl FeedRunner {
                         };
                         match checked {
                             Ok(_) => {
-                                self.db.mark_transformed(item, &Value::Array(resources))?;
+                                self.db
+                                    .mark_transformed(item, &Value::Array(resources), code)?;
                             }
                             Err(msg) => {
-                                self.db.reject_item(item, "received", "validation", &msg)?;
+                                self.db
+                                    .reject_item(item, "received", "validation", &msg, code)?;
                             }
                         }
                     }
@@ -1059,10 +1065,12 @@ impl FeedRunner {
                             &format!(
                                 "{resource_type} has no id; $bulk-submit stores resources by id"
                             ),
+                            None,
                         )?;
                     }
                     Err(msg) => {
-                        self.db.reject_item(item, "received", "validation", &msg)?;
+                        self.db
+                            .reject_item(item, "received", "validation", &msg, None)?;
                     }
                 }
             }
